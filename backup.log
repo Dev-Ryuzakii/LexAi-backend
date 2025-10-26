@@ -1,0 +1,11 @@
+2025-10-09 11:44:12,976 - INFO - Starting AI-CBT Theory database backup
+2025-10-09 11:44:12,976 - INFO - Backup destination: /Users/macbook/Ai-CBT-Theory/test_backup
+2025-10-09 11:44:12,977 - INFO - Processing database: database.db
+2025-10-09 11:44:12,981 - INFO - Integrity check passed for database.db
+2025-10-09 11:44:12,985 - INFO - Created backup: database.db_20251009_114412.backup (Checksum: 99b5b941...)
+2025-10-09 11:44:13,062 - INFO - Backup compressed: database.db_20251009_114412.backup.gz (GPG not available for encryption)
+2025-10-09 11:44:13,064 - INFO - Processing database: production_api.db
+2025-10-09 11:44:13,074 - INFO - Integrity check passed for production_api.db
+2025-10-09 11:44:13,078 - INFO - Created backup: production_api.db_20251009_114413.backup (Checksum: dee3bafb...)
+2025-10-09 11:44:13,123 - INFO - Backup compressed: production_api.db_20251009_114413.backup.gz (GPG not available for encryption)
+2025-10-09 11:44:13,124 - INFO - Backup complete. 2/2 databases processed successfully.

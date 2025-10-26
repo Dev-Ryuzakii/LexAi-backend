@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  # Redis for rate limiting
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Main AI-CBT API service
+  ai-cbt-api:
+    build: .
+    ports:
+      - "5001:5001"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - FLASK_ENV=production
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

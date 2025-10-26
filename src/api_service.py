@@ -1,0 +1,1669 @@
+from flask import Flask, request, jsonify, g
+from database import SessionLocal, Question, Student, Response, User, APIKey, AuthToken, hash_password, verify_password
+from ollama_service import ollama_service, fallback_similarity_score
+from ai_service_manager import ai_service_manager
+from preprocessing import preprocess_text
+import joblib
+import pandas as pd
+import logging
+import uuid
+import time
+import os
+import traceback
+import redis
+import json
+import secrets
+from datetime import datetime, timedelta
+from functools import wraps
+from typing import Dict, Any, Optional
+
+# Create logs directory if it doesn't exist
+os.makedirs('logs', exist_ok=True)
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(pathname)s:%(lineno)d',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('logs/api.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Add a custom formatter for better log structure
+class StructuredFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            'timestamp': self.formatTime(record),
+            'level': record.levelname,
+            'logger': record.name,
+            'message': record.getMessage(),
+            'module': record.module,
+            'function': record.funcName,
+            'line': record.lineno
+        }
+        
+        # Add exception info if present
+        if record.exc_info:
+            log_data['exception'] = self.formatException(record.exc_info)
+            
+        return json.dumps(log_data)
+
+# Initialize Redis for rate limiting
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+    REDIS_AVAILABLE = True
+    logger.info("Redis connected successfully for rate limiting")
+except Exception as e:
+    REDIS_AVAILABLE = False
+    logger.warning(f"Redis not available for rate limiting: {e}")
+
+# Enhanced API Authentication decorator with production API integration
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Log the request
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: API key authentication started")
+        
+        # Check for API key in headers or query parameters
+        api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
+        
+        # Check for Bearer token in Authorization header
+        auth_header = request.headers.get('Authorization')
+        bearer_token = None
+        if auth_header and auth_header.startswith('Bearer '):
+            bearer_token = auth_header[7:]  # Remove 'Bearer ' prefix
+        
+        # If no API key or token provided, return error
+        if not api_key and not bearer_token:
+            logger.warning(f"Request {request_id}: Missing API key or authentication token")
+            return jsonify({
+                'error': 'Missing authentication',
+                'message': 'Please provide a valid API key in X-API-Key header or api_key parameter, or a valid token in Authorization header',
+                'documentation': 'https://ai-cbt-api.com/docs/authentication'
+            }), 401
+        
+        # If we have a bearer token, validate it
+        if bearer_token:
+            try:
+                # Create database session
+                db = SessionLocal()
+                
+                # Query for the auth token
+                auth_token = db.query(AuthToken).filter(
+                    AuthToken.token == bearer_token,
+                    AuthToken.is_active == True,
+                    AuthToken.expires_at > datetime.utcnow()
+                ).first()
+                
+                if auth_token:
+                    # Get the associated user
+                    user = db.query(User).filter(User.id == auth_token.user_id).first()
+                    db.close()
+                    
+                    # Check if user is active (handle SQLAlchemy column access)
+                    user_is_active = getattr(user, 'is_active', True)
+                    if user and user_is_active:
+                        # Store user info in request context
+                        g.api_key_info = {
+                            'id': auth_token.id,
+                            'key': bearer_token,
+                            'name': 'Authenticated User',
+                            'user_id': user.id,
+                            'email': user.email,
+                            'rate_limit': 10000,  # Higher rate limit for authenticated users
+                            'monthly_quota': 100000,
+                            'plan_type': getattr(user, 'plan_type', 'free') or 'free',
+                            'is_legacy': False
+                        }
+                        
+                        logger.info(f"Request {request_id}: Bearer token validated successfully for user {user.id}")
+                        return f(*args, **kwargs)
+                
+                db.close()
+                logger.warning(f"Request {request_id}: Invalid or expired bearer token")
+                return jsonify({
+                    'error': 'Invalid or expired token',
+                    'message': 'The provided authentication token is invalid or has expired',
+                    'documentation': 'https://ai-cbt-api.com/docs/authentication'
+                }), 401
+                
+            except Exception as e:
+                logger.error(f"Request {request_id}: Bearer token validation error: {str(e)}")
+                return jsonify({
+                    'error': 'Authentication system error',
+                    'message': 'Could not validate authentication token due to internal error',
+                    'documentation': 'https://ai-cbt-api.com/docs/errors#500'
+                }), 500
+        
+        # Check for legacy development keys first (backward compatibility)
+        legacy_keys = {
+            'dev_key_123': {'name': 'Development Key', 'type': 'development', 'rate_limit': 1000},
+            'test_key_789': {'name': 'Testing Key', 'type': 'testing', 'rate_limit': 1000}
+        }
+        
+        if api_key in legacy_keys:
+            # Log legacy key usage for future migration
+            logger.warning(f"Request {request_id}: Legacy API key used: {legacy_keys[api_key]['name']}")
+            
+            # Store API key info in request context instead of directly on request object
+            g.api_key_info = {
+                'key': api_key,
+                'name': legacy_keys[api_key]['name'],
+                'type': legacy_keys[api_key]['type'],
+                'rate_limit': legacy_keys[api_key]['rate_limit'],
+                'is_legacy': True
+            }
+            return f(*args, **kwargs)
+        
+        # Try to validate against production database using SQLAlchemy
+        try:
+            # Create database session
+            db = SessionLocal()
+            
+            # Query for the API key with eager loading of the user relationship
+            api_key_record = db.query(APIKey).join(User).filter(
+                APIKey.api_key == api_key,
+                APIKey.is_active == True,
+                User.is_active == True
+            ).first()
+            
+            # Initialize user information variables
+            user_id = None
+            user_email = None
+            user_plan_type = None
+            
+            # Store the user information before closing the session
+            if api_key_record:
+                user_email = api_key_record.user.email
+                user_plan_type = api_key_record.user.plan_type
+                user_id = api_key_record.user_id
+            
+            db.close()
+            
+            if api_key_record:
+                # Store API key info in request context
+                g.api_key_info = {
+                    'id': api_key_record.id,
+                    'key': api_key,
+                    'name': api_key_record.key_name,
+                    'user_id': user_id,
+                    'email': user_email,
+                    'rate_limit': api_key_record.rate_limit,
+                    'monthly_quota': api_key_record.monthly_quota,
+                    'plan_type': user_plan_type,
+                    'is_legacy': False
+                }
+                
+                logger.info(f"Request {request_id}: API key validated successfully for user {user_id}")
+                return f(*args, **kwargs)
+            
+            # If we get here, the API key was not found in the production database
+            logger.warning(f"Request {request_id}: Invalid API key provided")
+            return jsonify({
+                'error': 'Invalid API key',
+                'message': 'The provided API key is invalid or inactive',
+                'documentation': 'https://ai-cbt-api.com/docs/authentication'
+            }), 401
+            
+        except Exception as e:
+            logger.error(f"Request {request_id}: API key validation error: {str(e)}")
+            
+            # Fallback to legacy keys for robustness
+            if api_key and (api_key.startswith('dev_') or api_key.startswith('test_')):
+                logger.warning(f"Request {request_id}: Allowing developer key due to validation error")
+                g.api_key_info = {
+                    'key': api_key,
+                    'name': 'Emergency Fallback Key',
+                    'type': 'emergency',
+                    'rate_limit': 1000,
+                    'is_legacy': True
+                }
+                return f(*args, **kwargs)
+                
+            return jsonify({
+                'error': 'Authentication system error',
+                'message': 'Could not validate API key due to internal error',
+                'documentation': 'https://ai-cbt-api.com/docs/errors#500'
+            }), 500
+            
+    return decorated_function
+
+def rate_limit(f):
+    """Rate limiting decorator using Redis"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        request_id = str(uuid.uuid4())
+        
+        if not REDIS_AVAILABLE:
+            # If Redis is not available, skip rate limiting
+            logger.warning(f"Request {request_id}: Redis not available, skipping rate limiting")
+            return f(*args, **kwargs)
+        
+        # Get API key info from request context
+        api_key_info = getattr(g, 'api_key_info', None)
+        if not api_key_info:
+            logger.warning(f"Request {request_id}: No API key info found, skipping rate limiting")
+            return f(*args, **kwargs)
+        
+        api_key = api_key_info.get('key')
+        rate_limit_count = api_key_info.get('rate_limit', 1000)  # Default to 1000 requests per hour
+        
+        # Create Redis keys for rate limiting
+        window_key = f"rate_limit:{api_key}:window"
+        count_key = f"rate_limit:{api_key}:count"
+        
+        # Get current time and window start time
+        now = datetime.utcnow()
+        window_start = now.replace(minute=0, second=0, microsecond=0)  # Start of current hour
+        window_end = window_start + timedelta(hours=1)
+        
+        try:
+            # Set the window start time if it doesn't exist
+            pipe = redis_client.pipeline()
+            pipe.setnx(window_key, window_start.isoformat())
+            pipe.expireat(window_key, int(window_end.timestamp()))
+            pipe.execute()
+            
+            # Get the current window start time
+            window_start_str = redis_client.get(window_key)
+            if window_start_str:
+                current_window_start = datetime.fromisoformat(window_start_str) if window_start_str and isinstance(window_start_str, str) else window_start
+            else:
+                current_window_start = window_start
+            
+            # If we're in a new window, reset the count
+            if current_window_start < window_start:
+                time_diff = window_end - now
+                expiration_seconds = int(time_diff.total_seconds())
+                redis_client.set(window_key, window_start.isoformat(), ex=expiration_seconds)
+                redis_client.set(count_key, 0, ex=expiration_seconds)
+            
+            # Increment the request count
+            current_count = redis_client.incr(count_key)
+            
+            # Set expiration if this is the first request in the window
+            if current_count == 1:
+                expiration_seconds = int((window_end - now).total_seconds())
+                redis_client.expire(count_key, expiration_seconds)
+            
+            # Check if we've exceeded the rate limit
+            if current_count > rate_limit_count:
+                logger.warning(f"Request {request_id}: Rate limit exceeded for API key {api_key}")
+                return jsonify({
+                    'error': 'Rate limit exceeded',
+                    'message': f'You have exceeded your rate limit of {rate_limit_count} requests per hour',
+                    'limit': rate_limit_count,
+                    'reset_time': window_end.isoformat()
+                }), 429
+                
+            logger.info(f"Request {request_id}: Rate limit check passed ({current_count}/{rate_limit_count})")
+        except Exception as e:
+            logger.error(f"Request {request_id}: Rate limiting error: {e}")
+            # If Redis fails, allow the request to proceed
+            pass
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+def validate_input(required_fields: list, optional_fields: dict | None = None):
+    """Input validation decorator"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            request_id = str(uuid.uuid4())
+            logger.info(f"Request {request_id}: Input validation started")
+            
+            data = request.get_json() or {}
+            
+            # Check required fields
+            missing_fields = []
+            for field in required_fields:
+                if field not in data or data[field] is None or (isinstance(data[field], str) and not data[field].strip()):
+                    missing_fields.append(field)
+            
+            if missing_fields:
+                logger.warning(f"Request {request_id}: Missing required fields: {missing_fields}")
+                return jsonify({
+                    'error': 'Missing required fields',
+                    'message': f'The following fields are required: {", ".join(missing_fields)}'
+                }), 400
+            
+            # Validate field types if specified
+            if optional_fields:
+                for field, field_type in optional_fields.items():
+                    if field in data and data[field] is not None:
+                        if field_type == 'int' and not isinstance(data[field], int):
+                            logger.warning(f"Request {request_id}: Invalid field type for {field}")
+                            return jsonify({
+                                'error': 'Invalid field type',
+                                'message': f'Field {field} must be an integer'
+                            }), 400
+                        elif field_type == 'str' and not isinstance(data[field], str):
+                            logger.warning(f"Request {request_id}: Invalid field type for {field}")
+                            return jsonify({
+                                'error': 'Invalid field type',
+                                'message': f'Field {field} must be a string'
+                            }), 400
+                        elif field_type == 'float' and not isinstance(data[field], (int, float)):
+                            logger.warning(f"Request {request_id}: Invalid field type for {field}")
+                            return jsonify({
+                                'error': 'Invalid field type',
+                                'message': f'Field {field} must be a number'
+                            }), 400
+            
+            logger.info(f"Request {request_id}: Input validation passed")
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def handle_db_error(func):
+    """Database error handling decorator"""
+    @wraps(func)
+    def decorated_function(*args, **kwargs):
+        request_id = str(uuid.uuid4())
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Request {request_id}: Database error in {func.__name__}: {e}")
+            return jsonify({
+                'error': 'Database error',
+                'message': 'An error occurred while accessing the database'
+            }), 500
+    return decorated_function
+
+def score_with_ollama_api(student_answer: str, marking_guide: str, question_text: str = "") -> dict:
+    """
+    Enhanced API version of scoring function with better error handling and metrics
+    """
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    try:
+        # Log scoring attempt
+        logger.info(f"API Scoring request {request_id}: Starting scoring process")
+        
+        # Input validation
+        if not student_answer or not marking_guide:
+            logger.warning(f"API Scoring {request_id}: Missing required input")
+            return {
+                'success': False,
+                'request_id': request_id,
+                'error': 'Missing required input',
+                'message': 'Both student_answer and marking_guide are required and cannot be empty'
+            }
+        
+        # Use the AI service manager which handles multiple providers and fallbacks
+        result = ai_service_manager.score_answer(student_answer, marking_guide, question_text)
+        
+        # Check if we got a cached result
+        if result.get("cached", False):
+            logger.info(f"API Scoring {request_id}: Retrieved cached result")
+        else:
+            method = result.get("scoring_method", "unknown")
+            logger.info(f"API Scoring {request_id}: Scored using {method}")
+        
+        processing_time = time.time() - start_time
+        
+        # Construct standardized response
+        response = {
+            'success': True,
+            'request_id': request_id,
+            'scoring_method': result.get("scoring_method", "unknown"),
+            'processing_time': round(processing_time, 3),
+            'model_used': result.get("model_used", "unknown"),
+            'cached': result.get("cached", False),
+            'data': {
+                "score": result.get("score", 0),
+                "confidence": result.get("confidence", 0.0),
+                "feedback": result.get("feedback", "No feedback provided"),
+                "strengths": result.get("strengths", []),
+                "weaknesses": result.get("weaknesses", [])
+            }
+        }
+        
+        logger.info(f"API Scoring {request_id}: Completed successfully in {processing_time:.3f}s")
+        return response
+        
+    except Exception as e:
+        # Log the error
+        processing_time = time.time() - start_time
+        logger.error(f"API Scoring {request_id}: Failed completely: {e}")
+        logger.error(f"API Scoring {request_id}: Traceback: {traceback.format_exc()}")
+        
+        # Return standardized error response
+        response = {
+            'success': False,
+            'request_id': request_id,
+            'error': str(e),
+            'error_type': type(e).__name__,
+            'processing_time': round(processing_time, 3),
+            'message': 'Scoring failed due to an unexpected error'
+        }
+        
+        return response
+
+def register_api_routes(app):
+    """Register all API routes"""
+    
+    @app.before_request
+    def before_request():
+        g.start_time = time.time()
+        g.request_id = str(uuid.uuid4())
+        logger.info(f"Request {g.request_id}: {request.method} {request.path} started")
+    
+    @app.after_request
+    def after_request(response):
+        if hasattr(g, 'start_time'):
+            duration = time.time() - g.start_time
+            logger.info(f"Request {g.request_id}: {request.method} {request.path} completed in {duration:.3f}s with status {response.status_code}")
+        return response
+    
+    @app.route('/', methods=['GET'])
+    def api_root():
+        """API Root - Provides information about the API service"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: API root requested")
+        
+        response = {
+            'service': 'LexAi-API-SERVICES',
+            'version': '1.0.0',
+            'description': 'AI-powered Computer-Based Testing API for educational assessment systems',
+            'documentation': 'http://localhost:5001/api/v1/docs',
+            'endpoints': {
+                'health': '/api/v1/health',
+                'questions': '/api/v1/questions',
+                'students': '/api/v1/students',
+                'responses': '/api/v1/responses',
+                'scoring': '/api/v1/score',
+                'api_keys': '/api/v1/api-keys'
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: API root completed")
+        return jsonify(response)
+    
+    @app.route('/api/v1/health', methods=['GET'])
+    def api_health():
+        """API Health Check"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Health check requested")
+        
+        # Get AI service statuses
+        ai_statuses = ai_service_manager.get_service_status()
+        
+        response = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'version': '1.0.0',
+            'services': {
+                'ai_providers': ai_statuses,
+                'database': True  # We assume DB is working if we got here
+            }
+        }
+        
+        logger.info(f"Request {request_id}: Health check completed")
+        return jsonify(response)
+    
+    @app.route('/api/v1/score', methods=['POST'])
+    @require_api_key
+    @rate_limit
+    @validate_input(['student_answer', 'marking_guide'], {'question_text': 'str'})
+    def api_score_answer():
+        """
+        Score a student answer against a marking guide
+        
+        Expected JSON payload:
+        {
+            "student_answer": "The answer text",
+            "marking_guide": "The expected answer or rubric",
+            "question_text": "Optional question context"
+        }
+        """
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Score answer requested")
+        
+        try:
+            data = request.get_json() or {}
+            
+            student_answer = data.get('student_answer', '').strip()
+            marking_guide = data.get('marking_guide', '').strip()
+            question_text = data.get('question_text', '').strip()
+            
+            # Score the answer
+            result = score_with_ollama_api(student_answer, marking_guide, question_text)
+            
+            response = {
+                'timestamp': datetime.now().isoformat(),
+                'request_id': request_id,
+                **result
+            }
+            
+            logger.info(f"Request {request_id}: Score answer completed")
+            return jsonify(response)
+            
+        except Exception as e:
+            logger.error(f"Request {request_id}: API score endpoint error: {e}")
+            return jsonify({
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/questions', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_questions():
+        """Get all available questions"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get questions requested")
+        
+        session_db = SessionLocal()
+        questions = session_db.query(Question).all()
+        session_db.close()
+        
+        questions_data = []
+        for q in questions:
+            # Convert SQLAlchemy datetime to Python datetime if it exists
+            created_at_value = None
+            if q.created_at is not None:
+                created_at_value = q.created_at.isoformat()
+                
+            questions_data.append({
+                'id': q.id,
+                'question_text': q.question_text,
+                'marking_guide': q.marking_guide,
+                'created_at': created_at_value
+            })
+        
+        response = {
+            'questions': questions_data,
+            'total_count': len(questions_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Get questions completed, found {len(questions_data)} questions")
+        return jsonify(response)
+    
+    @app.route('/api/v1/questions', methods=['POST'])
+    @require_api_key
+    @rate_limit
+    @validate_input(['question_text', 'marking_guide'])
+    @handle_db_error
+    def api_create_question():
+        """Create a new question"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Create question requested")
+        
+        data = request.get_json() or {}
+        
+        question_text = data.get('question_text', '').strip()
+        marking_guide = data.get('marking_guide', '').strip()
+        
+        session_db = SessionLocal()
+        new_question = Question(
+            question_text=question_text,
+            marking_guide=marking_guide
+        )
+        session_db.add(new_question)
+        session_db.commit()
+        
+        question_id = new_question.id
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'Question created successfully',
+            'question_id': question_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Question created with ID {question_id}")
+        return jsonify(response), 201
+    
+    @app.route('/api/v1/questions/<int:question_id>', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_question(question_id):
+        """Get a specific question by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get question {question_id} requested")
+        
+        session_db = SessionLocal()
+        question = session_db.query(Question).filter_by(id=question_id).first()
+        session_db.close()
+        
+        if not question:
+            logger.warning(f"Request {request_id}: Question {question_id} not found")
+            return jsonify({'error': 'Question not found'}), 404
+        
+        response = {
+            'question': {
+                'id': question.id,
+                'question_text': question.question_text,
+                'marking_guide': question.marking_guide,
+                'created_at': question.created_at.isoformat() if hasattr(question, 'created_at') else None
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Question {question_id} retrieved")
+        return jsonify(response)
+    
+    @app.route('/api/v1/questions/<int:question_id>', methods=['PUT'])
+    @require_api_key
+    @rate_limit
+    @validate_input([], {'question_text': 'str', 'marking_guide': 'str'})
+    @handle_db_error
+    def api_update_question(question_id):
+        """Update a specific question by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Update question {question_id} requested")
+        
+        data = request.get_json() or {}
+        
+        session_db = SessionLocal()
+        question = session_db.query(Question).filter_by(id=question_id).first()
+        
+        if not question:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Question {question_id} not found")
+            return jsonify({'error': 'Question not found'}), 404
+        
+        # Update fields if provided
+        if 'question_text' in data and data['question_text'] is not None:
+            question.question_text = data['question_text'].strip()
+        if 'marking_guide' in data and data['marking_guide'] is not None:
+            question.marking_guide = data['marking_guide'].strip()
+        
+        session_db.commit()
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'Question updated successfully',
+            'question_id': question_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Question {question_id} updated")
+        return jsonify(response)
+    
+    @app.route('/api/v1/questions/<int:question_id>', methods=['DELETE'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_delete_question(question_id):
+        """Delete a specific question by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Delete question {question_id} requested")
+        
+        session_db = SessionLocal()
+        question = session_db.query(Question).filter_by(id=question_id).first()
+        
+        if not question:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Question {question_id} not found")
+            return jsonify({'error': 'Question not found'}), 404
+        
+        # Also delete associated responses
+        session_db.query(Response).filter_by(question_id=question_id).delete()
+        session_db.delete(question)
+        session_db.commit()
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'Question deleted successfully',
+            'question_id': question_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Question {question_id} deleted")
+        return jsonify(response)
+    
+    @app.route('/api/v1/students', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_students():
+        """Get all students"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get students requested")
+        
+        session_db = SessionLocal()
+        students = session_db.query(Student).all()
+        session_db.close()
+        
+        students_data = []
+        for student in students:
+            students_data.append({
+                'id': student.id,
+                'name': student.name,
+                'matric_number': student.matric_number,
+                'score': student.score,
+                'created_at': student.created_at.isoformat() if hasattr(student, 'created_at') else None
+            })
+        
+        response = {
+            'students': students_data,
+            'total_count': len(students_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Get students completed, found {len(students_data)} students")
+        return jsonify(response)
+    
+    @app.route('/api/v1/students', methods=['POST'])
+    @require_api_key
+    @rate_limit
+    @validate_input(['name', 'matric_number'])
+    @handle_db_error
+    def api_create_student():
+        """Create or get a student"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Create student requested")
+        
+        data = request.get_json() or {}
+        
+        name = data.get('name', '').strip()
+        matric_number = data.get('matric_number', '').strip()
+        
+        session_db = SessionLocal()
+        
+        # Check if student already exists
+        existing_student = session_db.query(Student).filter_by(matric_number=matric_number).first()
+        
+        if existing_student:
+            session_db.close()
+            logger.info(f"Request {request_id}: Student with matric number {matric_number} already exists")
+            return jsonify({
+                'success': True,
+                'message': 'Student already exists',
+                'student_id': existing_student.id,
+                'student': {
+                    'id': existing_student.id,
+                    'name': existing_student.name,
+                    'matric_number': existing_student.matric_number,
+                    'score': existing_student.score
+                },
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        # Create new student
+        student = Student(name=name, matric_number=matric_number, score=0)
+        session_db.add(student)
+        session_db.commit()
+        student_id = student.id
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'Student created successfully',
+            'student_id': student_id,
+            'student': {
+                'id': student_id,
+                'name': name,
+                'matric_number': matric_number,
+                'score': 0
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Student created with ID {student_id}")
+        return jsonify(response), 201
+    
+    @app.route('/api/v1/students/<int:student_id>', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_student(student_id):
+        """Get a specific student by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get student {student_id} requested")
+        
+        session_db = SessionLocal()
+        student = session_db.query(Student).filter_by(id=student_id).first()
+        session_db.close()
+        
+        if not student:
+            logger.warning(f"Request {request_id}: Student {student_id} not found")
+            return jsonify({'error': 'Student not found'}), 404
+        
+        response = {
+            'student': {
+                'id': student.id,
+                'name': student.name,
+                'matric_number': student.matric_number,
+                'score': student.score,
+                'created_at': student.created_at.isoformat() if hasattr(student, 'created_at') else None
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Student {student_id} retrieved")
+        return jsonify(response)
+    
+    @app.route('/api/v1/students/<int:student_id>', methods=['PUT'])
+    @require_api_key
+    @rate_limit
+    @validate_input([], {'name': 'str', 'matric_number': 'str', 'score': 'int'})
+    @handle_db_error
+    def api_update_student(student_id):
+        """Update a specific student by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Update student {student_id} requested")
+        
+        data = request.get_json() or {}
+        
+        session_db = SessionLocal()
+        student = session_db.query(Student).filter_by(id=student_id).first()
+        
+        if not student:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Student {student_id} not found")
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Update fields if provided
+        if 'name' in data and data['name'] is not None:
+            student.name = data['name'].strip()
+        if 'matric_number' in data and data['matric_number'] is not None:
+            student.matric_number = data['matric_number'].strip()
+        if 'score' in data and data['score'] is not None:
+            student.score = data['score']
+        
+        session_db.commit()
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'Student updated successfully',
+            'student_id': student_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Student {student_id} updated")
+        return jsonify(response)
+    
+    @app.route('/api/v1/students/<int:student_id>', methods=['DELETE'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_delete_student(student_id):
+        """Delete a specific student by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Delete student {student_id} requested")
+        
+        session_db = SessionLocal()
+        student = session_db.query(Student).filter_by(id=student_id).first()
+        
+        if not student:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Student {student_id} not found")
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Also delete associated responses
+        session_db.query(Response).filter_by(student_id=student_id).delete()
+        session_db.delete(student)
+        session_db.commit()
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'Student deleted successfully',
+            'student_id': student_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Student {student_id} deleted")
+        return jsonify(response)
+    
+    @app.route('/api/v1/responses', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_responses():
+        """Get all responses"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get responses requested")
+        
+        session_db = SessionLocal()
+        responses = session_db.query(Response).all()
+        session_db.close()
+        
+        responses_data = []
+        for response in responses:
+            responses_data.append({
+                'id': response.id,
+                'student_id': response.student_id,
+                'question_id': response.question_id,
+                'answer': response.answer,
+                'score': response.score,
+                'ai_score': response.ai_score,
+                'ai_feedback': response.ai_feedback,
+                'ai_confidence': response.ai_confidence,
+                'created_at': response.created_at.isoformat() if hasattr(response, 'created_at') else None
+            })
+        
+        response_data = {
+            'responses': responses_data,
+            'total_count': len(responses_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Get responses completed, found {len(responses_data)} responses")
+        return jsonify(response_data)
+    
+    @app.route('/api/v1/responses', methods=['POST'])
+    @require_api_key
+    @rate_limit
+    @validate_input(['student_id', 'question_id', 'answer'])
+    @handle_db_error
+    def api_create_response():
+        """Create a new response"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Create response requested")
+        
+        data = request.get_json() or {}
+        
+        student_id = data.get('student_id')
+        question_id = data.get('question_id')
+        answer = data.get('answer', '').strip()
+        
+        session_db = SessionLocal()
+        
+        # Verify student and question exist
+        student = session_db.query(Student).filter_by(id=student_id).first()
+        question = session_db.query(Question).filter_by(id=question_id).first()
+        
+        if not student:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Student {student_id} not found")
+            return jsonify({'error': 'Student not found'}), 404
+        
+        if not question:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Question {question_id} not found")
+            return jsonify({'error': 'Question not found'}), 404
+        
+        # Create response
+        response = Response(
+            student_id=student_id,
+            question_id=question_id,
+            answer=answer
+        )
+        session_db.add(response)
+        session_db.commit()
+        response_id = response.id
+        session_db.close()
+        
+        response_data = {
+            'success': True,
+            'message': 'Response created successfully',
+            'response_id': response_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Response created with ID {response_id}")
+        return jsonify(response_data), 201
+    
+    @app.route('/api/v1/responses/<int:response_id>', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_response(response_id):
+        """Get a specific response by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get response {response_id} requested")
+        
+        session_db = SessionLocal()
+        response = session_db.query(Response).filter_by(id=response_id).first()
+        session_db.close()
+        
+        if not response:
+            logger.warning(f"Request {request_id}: Response {response_id} not found")
+            return jsonify({'error': 'Response not found'}), 404
+        
+        response_data = {
+            'response': {
+                'id': response.id,
+                'student_id': response.student_id,
+                'question_id': response.question_id,
+                'answer': response.answer,
+                'score': response.score,
+                'ai_score': response.ai_score,
+                'ai_feedback': response.ai_feedback,
+                'ai_confidence': response.ai_confidence,
+                'created_at': response.created_at.isoformat() if hasattr(response, 'created_at') else None
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Response {response_id} retrieved")
+        return jsonify(response_data)
+    
+    @app.route('/api/v1/responses/<int:response_id>', methods=['PUT'])
+    @require_api_key
+    @rate_limit
+    @validate_input([], {'student_id': 'int', 'question_id': 'int', 'answer': 'str', 'score': 'float'})
+    @handle_db_error
+    def api_update_response(response_id):
+        """Update a specific response by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Update response {response_id} requested")
+        
+        data = request.get_json() or {}
+        
+        session_db = SessionLocal()
+        response = session_db.query(Response).filter_by(id=response_id).first()
+        
+        if not response:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Response {response_id} not found")
+            return jsonify({'error': 'Response not found'}), 404
+        
+        # Update fields if provided
+        if 'student_id' in data and data['student_id'] is not None:
+            response.student_id = data['student_id']
+        if 'question_id' in data and data['question_id'] is not None:
+            response.question_id = data['question_id']
+        if 'answer' in data and data['answer'] is not None:
+            response.answer = data['answer'].strip()
+        if 'score' in data and data['score'] is not None:
+            response.score = data['score']
+        
+        session_db.commit()
+        session_db.close()
+        
+        response_data = {
+            'success': True,
+            'message': 'Response updated successfully',
+            'response_id': response_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Response {response_id} updated")
+        return jsonify(response_data)
+    
+    @app.route('/api/v1/responses/<int:response_id>', methods=['DELETE'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_delete_response(response_id):
+        """Delete a specific response by ID"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Delete response {response_id} requested")
+        
+        session_db = SessionLocal()
+        response = session_db.query(Response).filter_by(id=response_id).first()
+        
+        if not response:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Response {response_id} not found")
+            return jsonify({'error': 'Response not found'}), 404
+        
+        session_db.delete(response)
+        session_db.commit()
+        session_db.close()
+        
+        response_data = {
+            'success': True,
+            'message': 'Response deleted successfully',
+            'response_id': response_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Response {response_id} deleted")
+        return jsonify(response_data)
+    
+    @app.route('/api/v1/submit-response', methods=['POST'])
+    @require_api_key
+    @rate_limit
+    @validate_input(['student_id', 'question_id', 'answer'])
+    @handle_db_error
+    def api_submit_response():
+        """Submit and score a student response"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Submit response requested")
+        
+        data = request.get_json() or {}
+        
+        student_id = data.get('student_id')
+        question_id = data.get('question_id')
+        answer = data.get('answer', '').strip()
+        
+        session_db = SessionLocal()
+        
+        # Verify student and question exist
+        student = session_db.query(Student).filter_by(id=student_id).first()
+        question = session_db.query(Question).filter_by(id=question_id).first()
+        
+        if not student:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Student {student_id} not found")
+            return jsonify({'error': 'Student not found'}), 404
+        
+        if not question:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Question {question_id} not found")
+            return jsonify({'error': 'Question not found'}), 404
+        
+        # Score the response
+        scoring_result = score_with_ollama_api(
+            answer, 
+            str(question.marking_guide) if question.marking_guide is not None else "", 
+            str(question.question_text) if question.question_text is not None else ""
+        )
+        
+        if not scoring_result['success']:
+            session_db.close()
+            logger.error(f"Request {request_id}: Scoring failed: {scoring_result.get('message', 'Unknown error')}")
+            return jsonify({
+                'error': 'Scoring failed',
+                'message': scoring_result.get('message', 'Unknown scoring error')
+            }), 500
+        
+        score_data = scoring_result['data']
+        score = score_data["score"]
+        ai_feedback = score_data["feedback"]
+        ai_confidence = score_data["confidence"]
+        ai_strengths = str(score_data["strengths"])
+        ai_weaknesses = str(score_data["weaknesses"])
+        
+        # Save the response
+        response = Response(
+            student_id=student_id,
+            question_id=question_id,
+            answer=answer,
+            score=score,
+            ai_score=score,
+            ai_feedback=ai_feedback,
+            ai_confidence=ai_confidence,
+            ai_strengths=ai_strengths,
+            ai_weaknesses=ai_weaknesses
+        )
+        session_db.add(response)
+        session_db.commit()
+        
+        # Update student's total score
+        student.score += score
+        session_db.commit()
+        
+        response_id = response.id
+        session_db.close()
+        
+        response_data = {
+            'success': True,
+            'message': 'Response submitted and scored successfully',
+            'response_id': response_id,
+            'scoring': {
+                'score': score,
+                'max_score': 5,
+                'feedback': ai_feedback,
+                'confidence': ai_confidence,
+                'strengths': ai_strengths,
+                'weaknesses': ai_weaknesses,
+                'method': scoring_result['scoring_method']
+            },
+            'student_total_score': student.score,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Response {response_id} submitted and scored")
+        return jsonify(response_data), 201
+    
+    @app.route('/api/v1/student/<int:student_id>/responses', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_student_responses(student_id):
+        """Get all responses for a specific student"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get responses for student {student_id} requested")
+        
+        session_db = SessionLocal()
+        
+        student = session_db.query(Student).filter_by(id=student_id).first()
+        if not student:
+            session_db.close()
+            logger.warning(f"Request {request_id}: Student {student_id} not found")
+            return jsonify({'error': 'Student not found'}), 404
+        
+        responses = (session_db.query(Response, Question)
+                    .join(Question, Response.question_id == Question.id)
+                    .filter(Response.student_id == student_id)
+                    .all())
+        
+        response_data = []
+        for response_db, question in responses:
+            response_data.append({
+                'response_id': response_db.id,
+                'question': {
+                    'id': question.id,
+                    'text': question.question_text,
+                    'marking_guide': question.marking_guide
+                },
+                'answer': response_db.answer,
+                'score': response_db.score,
+                'ai_score': response_db.ai_score,
+                'ai_feedback': response_db.ai_feedback,
+                'ai_confidence': response_db.ai_confidence,
+                'ai_strengths': response_db.ai_strengths,
+                'ai_weaknesses': response_db.ai_weaknesses,
+                'submitted_at': response_db.created_at.isoformat() if hasattr(response_db, 'created_at') else None
+            })
+        
+        session_db.close()
+        
+        response_result = {
+            'student': {
+                'id': student.id,
+                'name': student.name,
+                'matric_number': student.matric_number,
+                'total_score': student.score
+            },
+            'responses': response_data,
+            'total_responses': len(response_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Retrieved {len(response_data)} responses for student {student_id}")
+        return jsonify(response_result)
+    
+    @app.route('/api/v1/api-keys', methods=['GET'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_get_api_keys():
+        """Get all API keys for the authenticated user"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Get API keys requested")
+        
+        # Get the authenticated user from the API key
+        api_key_info = getattr(g, 'api_key_info', None)
+        if not api_key_info:
+            logger.warning(f"Request {request_id}: No API key info found")
+            return jsonify({'error': 'Unable to identify user'}), 401
+        
+        user_id = api_key_info.get('user_id')
+        if not user_id:
+            logger.warning(f"Request {request_id}: No user ID found in API key info")
+            return jsonify({'error': 'Unable to identify user'}), 401
+        
+        session_db = SessionLocal()
+        api_keys = session_db.query(APIKey).filter_by(user_id=user_id).all()
+        session_db.close()
+        
+        api_keys_data = []
+        for key in api_keys:
+            api_keys_data.append({
+                'id': key.id,
+                'key_name': key.key_name,
+                'api_key': key.api_key,
+                'user_id': key.user_id,
+                'rate_limit': key.rate_limit,
+                'monthly_quota': key.monthly_quota,
+                'is_active': key.is_active,
+                'created_at': key.created_at.isoformat() if hasattr(key, 'created_at') else None
+            })
+        
+        response = {
+            'api_keys': api_keys_data,
+            'total_count': len(api_keys_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: Get API keys completed, found {len(api_keys_data)} keys")
+        return jsonify(response)
+    
+    @app.route('/api/v1/api-keys', methods=['POST'])
+    @require_api_key
+    @rate_limit
+    @validate_input(['email', 'key_name'])
+    @handle_db_error
+    def api_create_api_key():
+        """Create a new API key"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Create API key requested")
+        
+        data = request.get_json() or {}
+        
+        email = data.get('email', '').strip()
+        key_name = data.get('key_name', '').strip()
+        plan_type = data.get('plan_type', '').strip() if data.get('plan_type') else None
+        rate_limit = data.get('rate_limit', 1000)
+        monthly_quota = data.get('monthly_quota', 10000)
+        
+        # Generate a unique API key
+        api_key_value = f"lexai_{uuid.uuid4().hex[:32]}"
+        
+        session_db = SessionLocal()
+        
+        try:
+            # First, check if user exists, if not create them
+            user = session_db.query(User).filter_by(email=email).first()
+            if not user:
+                user = User(email=email, plan_type=plan_type)
+                session_db.add(user)
+                session_db.flush()  # Get the user ID without committing
+            
+            # Create the API key
+            api_key = APIKey(
+                key_name=key_name,
+                api_key=api_key_value,
+                user_id=user.id,
+                rate_limit=rate_limit,
+                monthly_quota=monthly_quota,
+                is_active=True
+            )
+            session_db.add(api_key)
+            session_db.commit()
+            
+            # Extract all necessary information before closing the session
+            api_key_id = api_key.id
+            user_id = user.id
+            
+            session_db.close()
+            
+            response = {
+                'success': True,
+                'message': 'API key created successfully',
+                'api_key': {
+                    'id': api_key_id,
+                    'key_name': key_name,
+                    'api_key': api_key_value,
+                    'user_id': user_id,
+                    'rate_limit': rate_limit,
+                    'monthly_quota': monthly_quota,
+                    'is_active': True,
+                    'created_at': datetime.now().isoformat()
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            logger.info(f"Request {request_id}: API key created with ID {api_key_id}")
+            return jsonify(response), 201
+            
+        except Exception as e:
+            session_db.rollback()
+            session_db.close()
+            logger.error(f"Request {request_id}: API key creation failed: {e}")
+            return jsonify({
+                'error': 'Failed to create API key',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/api-keys/<int:key_id>', methods=['DELETE'])
+    @require_api_key
+    @rate_limit
+    @handle_db_error
+    def api_revoke_api_key(key_id):
+        """Revoke an API key"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Revoke API key {key_id} requested")
+        
+        # Get the authenticated user from the API key
+        api_key_info = getattr(g, 'api_key_info', None)
+        if not api_key_info:
+            logger.warning(f"Request {request_id}: No API key info found")
+            return jsonify({'error': 'Unable to identify user'}), 401
+        
+        user_id = api_key_info.get('user_id')
+        if not user_id:
+            logger.warning(f"Request {request_id}: No user ID found in API key info")
+            return jsonify({'error': 'Unable to identify user'}), 401
+        
+        session_db = SessionLocal()
+        
+        # Check if the API key belongs to the user
+        api_key = session_db.query(APIKey).filter_by(id=key_id, user_id=user_id).first()
+        
+        if not api_key:
+            session_db.close()
+            logger.warning(f"Request {request_id}: API key {key_id} not found or doesn't belong to user")
+            return jsonify({'error': 'API key not found'}), 404
+        
+        # Revoke the API key
+        setattr(api_key, 'is_active', False)
+        session_db.commit()
+        session_db.close()
+        
+        response = {
+            'success': True,
+            'message': 'API key revoked successfully',
+            'api_key_id': key_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"Request {request_id}: API key {key_id} revoked")
+        return jsonify(response)
+
+    @app.route('/api/v1/register', methods=['POST'])
+    @validate_input(['email', 'password'])
+    @handle_db_error
+    def api_register():
+        """Register a new user"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: User registration requested")
+        
+        data = request.get_json() or {}
+        
+        email = data.get('email', '').strip()
+        password = data.get('password', '').strip()
+        
+        session_db = SessionLocal()
+        
+        try:
+            # Check if user already exists
+            existing_user = session_db.query(User).filter_by(email=email).first()
+            if existing_user:
+                session_db.close()
+                logger.warning(f"Request {request_id}: User with email {email} already exists")
+                return jsonify({
+                    'error': 'User already exists',
+                    'message': 'A user with this email already exists'
+                }), 409
+            
+            # Create new user
+            password_hash_str = hash_password(password)
+            user = User(
+                email=email,
+                password_hash=password_hash_str
+            )
+            session_db.add(user)
+            session_db.commit()
+            session_db.refresh(user)
+            
+            user_id = user.id
+            session_db.close()
+            
+            response = {
+                'success': True,
+                'message': 'User registered successfully',
+                'user': {
+                    'id': user_id,
+                    'email': email,
+                    'created_at': datetime.now().isoformat()
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            logger.info(f"Request {request_id}: User {user_id} registered successfully")
+            return jsonify(response), 201
+            
+        except Exception as e:
+            session_db.rollback()
+            session_db.close()
+            logger.error(f"Request {request_id}: User registration failed: {e}")
+            return jsonify({
+                'error': 'Registration failed',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/login', methods=['POST'])
+    @validate_input(['email', 'password'])
+    @handle_db_error
+    def api_login():
+        """Login a user and generate an authentication token"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: User login requested")
+        
+        data = request.get_json() or {}
+        
+        email = data.get('email', '').strip()
+        password = data.get('password', '').strip()
+        
+        session_db = SessionLocal()
+        
+        try:
+            # Find user by email
+            user = session_db.query(User).filter_by(email=email).first()
+            if not user:
+                session_db.close()
+                logger.warning(f"Request {request_id}: User with email {email} not found")
+                return jsonify({
+                    'error': 'Invalid credentials',
+                    'message': 'Invalid email or password'
+                }), 401
+            
+            # Verify password (handle SQLAlchemy column access)
+            user_password_hash = getattr(user, 'password_hash', '')
+            if not verify_password(password, user_password_hash):
+                session_db.close()
+                logger.warning(f"Request {request_id}: Invalid password for user {email}")
+                return jsonify({
+                    'error': 'Invalid credentials',
+                    'message': 'Invalid email or password'
+                }), 401
+            
+            # Extract user information before closing the session
+            user_id = user.id
+            user_email = user.email
+            
+            # Generate authentication token
+            token = f"auth_{secrets.token_urlsafe(32)}"
+            expires_at = datetime.utcnow() + timedelta(hours=24)  # Token expires in 24 hours
+            
+            auth_token = AuthToken(
+                token=token,
+                user_id=user_id,
+                expires_at=expires_at
+            )
+            session_db.add(auth_token)
+            session_db.commit()
+            session_db.refresh(auth_token)
+            
+            token_id = auth_token.id
+            session_db.close()
+            
+            response = {
+                'success': True,
+                'message': 'Login successful',
+                'token': token,
+                'expires_at': expires_at.isoformat(),
+                'user': {
+                    'id': user_id,
+                    'email': user_email
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            logger.info(f"Request {request_id}: User {user_id} logged in successfully")
+            return jsonify(response), 200
+            
+        except Exception as e:
+            session_db.rollback()
+            session_db.close()
+            logger.error(f"Request {request_id}: User login failed: {e}")
+            return jsonify({
+                'error': 'Login failed',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/logout', methods=['POST'])
+    @require_api_key
+    @handle_db_error
+    def api_logout():
+        """Logout a user by revoking their authentication token"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: User logout requested")
+        
+        # Get the authentication token from headers
+        auth_token = request.headers.get('Authorization')
+        if auth_token and auth_token.startswith('Bearer '):
+            auth_token = auth_token[7:]  # Remove 'Bearer ' prefix
+        else:
+            logger.warning(f"Request {request_id}: Missing or invalid Authorization header")
+            return jsonify({
+                'error': 'Missing or invalid token',
+                'message': 'Please provide a valid authentication token in Authorization header'
+            }), 401
+        
+        session_db = SessionLocal()
+        
+        try:
+            # Find and deactivate the token using update statement
+            result = session_db.query(AuthToken).filter(
+                AuthToken.token == auth_token, 
+                AuthToken.is_active == True
+            ).update({AuthToken.is_active: False})
+            
+            if result == 0:
+                session_db.close()
+                logger.warning(f"Request {request_id}: Invalid or expired token")
+                return jsonify({
+                    'error': 'Invalid or expired token',
+                    'message': 'The provided token is invalid or has expired'
+                }), 401
+            
+            session_db.commit()
+            session_db.close()
+            
+            response = {
+                'success': True,
+                'message': 'Logout successful',
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            logger.info(f"Request {request_id}: User logged out successfully")
+            return jsonify(response), 200
+            
+        except Exception as e:
+            session_db.rollback()
+            session_db.close()
+            logger.error(f"Request {request_id}: User logout failed: {e}")
+            return jsonify({
+                'error': 'Logout failed',
+                'message': str(e)
+            }), 500
+
+# Import at the end to avoid circular imports
+from database import init_db
+
+# Add main section to run the API service
+from flask import Flask
+
+# Create Flask app
+app = Flask(__name__)
+
+if __name__ == '__main__':
+    # Initialize the database
+    init_db()
+    
+    # Register API routes
+    register_api_routes(app)
+    
+    print("🚀 AI-CBT API Service Starting...")
+    print("=" * 50)
+    print("🌐 API Service: http://localhost:5001/api/v1/")
+    print("📖 Documentation: http://localhost:5001/api/v1/docs")
+    print("=" * 50)
+    print("✅ Ready to serve intelligent assessment requests!")
+    
+    app.run(debug=True, host='0.0.0.0', port=5001)
