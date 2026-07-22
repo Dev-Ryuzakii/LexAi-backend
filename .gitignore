@@ -1,1 +1,12 @@
+__pycache__/
+*.pyc
+*.pyc.backup
+*.backup
+.env
 venv/
+logs/*.log
+backup.log
+cookies.txt
+src/secrets
+src/data/*.db
+test_backup/
