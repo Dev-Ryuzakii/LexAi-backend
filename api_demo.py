@@ -4,13 +4,14 @@ AI-CBT API Testing Script
 Demonstrates how to use the AI-CBT Assessment API
 """
 
+import os
 import requests
 import json
 import time
 from typing import Dict, Any
 
 class AIAssessmentAPI:
-    def __init__(self, base_url: str = "http://localhost:5001/api/v1", api_key: str = "dev_key_123"):
+    def __init__(self, base_url: str = "http://localhost:5001/api/v1", api_key: str = os.environ.get("LEXAI_API_KEY", "")):
         self.base_url = base_url
         self.api_key = api_key
         self.headers = {

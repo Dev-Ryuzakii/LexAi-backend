@@ -1,266 +1,140 @@
-# AI-CBT API Platform
+# LexAi Backend
 
-AI-powered Computer-Based Testing API for educational assessment systems.
+AI-assisted grading API for computer-based tests. Schools' CBT systems (and the
+[LexAi frontend](https://github.com/Dev-Ryuzakii/LexAi-frontend), a separate repo) call it
+to grade theory answers against a marking guide.
 
-## Overview
+Grading uses Ollama first, then PaLM, Cohere or Hugging Face when their keys are set. If none
+of them can grade, the API either reports that grading failed or returns a text-similarity
+estimate marked for lecturer review. It never presents a failure as a zero, or a guess as a grade.
 
-The AI-CBT Assessment Platform provides a comprehensive RESTful API for integrating AI-powered educational assessment capabilities into your applications. The API supports multiple AI providers including Ollama, Google PaLM, Cohere, and Hugging Face, with automatic fallback mechanisms to ensure maximum uptime.
+## Quick start
 
-## Features
+Requires Python 3.11+. Redis is optional (it shares rate-limit and quota counters across
+workers), and Ollama is needed for AI grading.
 
-- 🤖 **AI-Powered Scoring**: Uses Ollama AI models for intelligent answer evaluation
-- 📚 **Question Management**: CRUD operations for assessment questions
-- 👥 **Student Management**: Student registration and response tracking
-- 🔒 **API Key Authentication**: Secure access control
-- 📊 **Detailed Feedback**: Comprehensive scoring with strengths/weaknesses analysis
-- 🔄 **Fallback Systems**: Multiple scoring methods for reliability
-- 📈 **Rate Limiting**: Redis-based rate limiting for API protection
-- 📝 **Structured Logging**: Comprehensive logging for monitoring and debugging
-- 🛡️ **Security Headers**: Protection against common web vulnerabilities
-- 🌐 **CORS Support**: Cross-origin resource sharing configuration
-- 📦 **Database Migrations**: Alembic-based database schema management
-- 📊 **Performance Monitoring**: Request/response time tracking
-- 📋 **Comprehensive Documentation**: Interactive Swagger UI documentation
-
-## Technology Stack
-
-- **Backend**: Python, Flask, Flask-RESTX (Swagger)
-- **Database**: SQLite (with SQLAlchemy ORM)
-- **AI Services**: Ollama, Google PaLM, Cohere, Hugging Face Transformers
-- **Caching**: Redis for rate limiting
-- **Documentation**: Swagger UI for interactive API documentation
-- **Logging**: Structured logging with file and console output
-- **Security**: CORS, Security Headers
-- **Database Management**: Alembic for migrations
-- **Containerization**: Docker and Docker Compose support
-
-## Prerequisites
-
-- Python 3.8+
-- Redis server
-- Ollama (for AI scoring)
-- Virtual environment (recommended)
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone <repository-url>
-   cd ai-cbt-theory
-   ```
-
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Start Redis server:
-   ```bash
-   redis-server
-   ```
-
-5. Start Ollama (if using local AI models):
-   ```bash
-   ollama run llama2
-   ```
-
-## Running the Application
-
-Start the API server:
 ```bash
-python src/app_api.py
+python -m venv venv
+source venv/bin/activate            # Windows: venv\Scripts\activate
+pip install -r requirements-dev.txt
+cp .env.example .env                # then edit
+alembic upgrade head                # create/upgrade the database
+python src/app_api.py               # http://127.0.0.1:5001/api/v1/
 ```
 
-The API will be available at:
-- Main Platform: http://localhost:5001/
-- API Documentation: http://localhost:5001/api/v1/docs/
+Or run `./start.sh` (or `start_platform.bat` on Windows), which does the same.
 
-## API Endpoints
+With Docker, `docker compose up --build` runs migrations and serves with gunicorn on port 5001.
+It expects Ollama on the host at `http://host.docker.internal:11434`.
 
-### Authentication
+All settings are environment variables. `.env.example` lists every variable and its default.
 
-All API endpoints require authentication via API key. Include your API key in the `X-API-Key` header:
+## Authentication
 
-```
-X-API-Key: YOUR_API_KEY_HERE
-```
+| Credential | How to get it | Header | Can call |
+|---|---|---|---|
+| Session token | `POST /api/v1/login` | `Authorization: Bearer <token>` | Everything |
+| API key | Create one in the frontend, or call `POST /api/v1/api-keys` with a session | `X-API-Key: <key>` | Everything except key management and logout |
 
-For testing purposes, you can use these development keys:
-- `dev_key_123` - Development key
-- `test_key_789` - Testing key
+- The API has no built-in development keys. Any key that isn't in the database is rejected. If the credential lookup itself fails, the request fails with 503 instead of being let through.
+- Passwords are hashed with Werkzeug (scrypt/pbkdf2). Old SHA-256 hashes are still accepted and are upgraded the next time the user logs in.
+- API keys and session tokens are stored only as SHA-256 digests. A key is shown once, when it is created or rotated. After that, lists show only its prefix.
+- A new key belongs to the logged-in user. Any `email` field in the request is ignored.
 
-### Core Endpoints
+## Data ownership
 
-#### Health Check
-```
-GET /api/v1/health
-```
-Check the health status of the API service.
+Every question, student and response belongs to the user who created it, and every query is
+filtered by owner. Other users get `404` for records that aren't theirs. Matric numbers must be
+unique within one owner's records, not across all owners.
 
-#### Questions Management
-```
-GET /api/v1/questions
-```
-Retrieve all questions.
+## Grading rules
 
-```
-GET /api/v1/questions/{id}
-```
-Retrieve a specific question by ID.
+- `POST /api/v1/submit-response` grades an answer and stores it. Each student can submit **one response per question**. A second submission returns `409` and does not call the AI.
+- If no provider can grade, the response is `503 SCORE_001` and **nothing is stored**, so the client can safely retry.
+- A grade is stored as `needs_review` (and left out of the student's total) when the AI's confidence is below `REVIEW_CONFIDENCE_THRESHOLD` or when it came from the text-similarity fallback. A lecturer confirms or overrides it with `PUT /api/v1/responses/{id}` `{"score": n}`.
+- A student's `score` is always the sum of their graded responses. It is recalculated in the same transaction whenever a response is created, rescored or deleted, and it can't be set directly.
+- Model output becomes a grade only if it is valid JSON with a whole-number score from 0 to 5. Anything else is retried once and then treated as a failure.
 
-```
-POST /api/v1/questions
-```
-Create a new question.
+## Limits
 
-```
-PUT /api/v1/questions/{id}
-```
-Update an existing question.
+| Limit | Default | Applies to |
+|---|---|---|
+| Hourly rate limit | Set per key (test plan max 100, production plan max 1000); 1000 for sessions | Authenticated endpoints |
+| Monthly quota | Set per key (test plan max 1000, production plan max 10000) | API-key requests |
+| Login attempts | 10 per 15 minutes per IP | `/login` |
+| Registrations | 5 per hour per IP | `/register` |
 
-```
-DELETE /api/v1/questions/{id}
-```
-Delete a question.
+Responses carry `X-RateLimit-Limit`, `-Used`, `-Remaining` and `-Reset` headers. If you run more
+than one worker, use Redis. Without it, each process keeps its own counters.
 
-#### Students Management
-```
-GET /api/v1/students
-```
-Retrieve all students.
+## Endpoints
 
-```
-GET /api/v1/students/{id}
-```
-Retrieve a specific student by ID.
+All paths are under `/api/v1`.
 
-```
-POST /api/v1/students
-```
-Create a new student.
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/health` | No auth. Returns 503 if the database is unreachable |
+| POST | `/register`, `/login` | Rate-limited by IP |
+| POST | `/logout` | Needs a session |
+| POST | `/score` | Stateless grading. Returns `needs_review`, or `503` when no grade could be produced |
+| GET/POST | `/questions` | Lists accept `limit` (max 500) and `offset` |
+| GET/PUT/DELETE | `/questions/{id}` | Deleting a question also deletes its responses and recalculates totals |
+| GET/POST | `/students` | |
+| GET/PUT/DELETE | `/students/{id}` | |
+| GET/POST | `/responses` | Filter with `student_id`, `question_id` or `grading_status`. POST stores an ungraded answer |
+| GET/PUT/DELETE | `/responses/{id}` | PUT `score` is a lecturer override |
+| POST | `/submit-response` | Grades and stores an answer |
+| GET | `/student/{id}/responses` | |
+| GET/POST | `/api-keys` | Needs a session |
+| DELETE | `/api-keys/{id}` | Revokes the key |
+| POST | `/api-keys/{id}/rotate` | Revokes the old key and returns a new one |
 
-```
-PUT /api/v1/students/{id}
-```
-Update an existing student.
+Errors use one shape:
 
-```
-DELETE /api/v1/students/{id}
-```
-Delete a student.
-
-#### Response Scoring
-```
-POST /api/v1/responses/score
-```
-Score a student response using AI.
-
-```
-GET /api/v1/responses
-```
-Retrieve all responses.
-
-```
-GET /api/v1/responses/{id}
-```
-Retrieve a specific response by ID.
-
-```
-POST /api/v1/responses
-```
-Create a new response.
-
-```
-PUT /api/v1/responses/{id}
-```
-Update an existing response.
-
-```
-DELETE /api/v1/responses/{id}
+```json
+{ "success": false,
+  "error": { "code": "VAL_001", "message": "...", "details": { "validation_errors": [] } },
+  "message": "...", "request_id": "...", "timestamp": "..." }
 ```
 
-#### Submit and Score Response
-```
-POST /api/v1/submit-response
-```
-Submit and automatically score a student response.
+The main error codes are: `AUTH_001` missing credentials, `AUTH_002` invalid or expired credentials, `AUTH_003` a session is
+required, `AUTH_004` wrong email or password, `AUTH_005` authentication is unavailable, `VAL_00x` validation,
+`RES_001` not found, `RES_002`/`RES_003` conflicts, `RATE_00x` limits, `SCORE_001` grading unavailable.
 
-#### Get Student Responses
-```
-GET /api/v1/student/{student_id}/responses
-```
-Retrieve all responses for a specific student.
+## Operator CLI
 
-## Rate Limiting
-
-The API implements rate limiting using Redis with a sliding window approach:
-- Default limit: 1000 requests per hour
-- Rate limit is applied per API key
-- Exceeding the limit returns a 429 status code
-
-## Error Handling
-
-The API uses standard HTTP status codes:
-- 200: Success
-- 201: Created
-- 400: Bad Request
-- 401: Unauthorized
-- 404: Not Found
-- 429: Rate Limit Exceeded
-- 500: Internal Server Error
-
-## Logging
-
-Structured logging is implemented for all API requests:
-- Log levels: INFO, WARNING, ERROR
-- Log location: logs/api.log
-- Console output also available
-
-## Configuration
-
-The API service can be configured through environment variables:
-- `REDIS_HOST`: Redis server host (default: localhost)
-- `REDIS_PORT`: Redis server port (default: 6379)
-- `DATABASE_URL`: Database connection string
-- `LOG_LEVEL`: Logging level (default: INFO)
-
-## Testing
-
-Run the API tests:
 ```bash
-python -m pytest tests/
+python src/generate_api_keys.py create --email user@example.com --name "CBT integration" --plan production
+python src/generate_api_keys.py list
+python src/generate_api_keys.py revoke --id 3
 ```
 
-Or run the comprehensive test script:
+## Upgrading an existing database
+
+`alembic upgrade head` applies `20261015_security_ownership`, which:
+
+- adds `owner_id` to questions, students and responses. Set `LEGACY_OWNER_EMAIL=<email>` while migrating to give existing rows to that user. Without it, those rows have no owner and the API doesn't return them;
+- replaces stored API keys with their hashes, so existing keys keep working;
+- deletes the stored session tokens, because they were saved in plaintext. Users have to log in again;
+- adds the one-response-per-question constraint. The migration stops and lists the conflicting rows if any student already has several responses to the same question.
+
+Back up the database first. This migration can't be reversed.
+
+> **Credentials in git history:** earlier commits included `data/database.db`, which contains
+> plaintext API keys and login tokens for test accounts. Those keys are public. Revoke every key
+> that was ever created in that database, and don't reuse that file.
+
+## Tests
+
 ```bash
-python tests/test_api.py
+pytest
 ```
 
-The test suite includes:
-- Health check tests
-- Authentication tests
-- CRUD operations for questions, students, and responses
-- Rate limiting tests
-- API documentation accessibility tests
+The suite runs in-process with a temporary SQLite database and a fake grader, so you don't need a
+server, Redis or Ollama. It checks authentication, isolation between users, key handling, quotas,
+the parser, submission rules and how totals are kept.
 
-## Contributing
+## Training scripts
 
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Support
-
-For support, please open an issue on the repository or contact the development team.# LexAi-backend
+`src/train.py`, `src/model.py` and `src/evaluate.py` belong to the earlier TF-IDF model and the API
+doesn't use them. They need `pip install -r requirements-ml.txt`.

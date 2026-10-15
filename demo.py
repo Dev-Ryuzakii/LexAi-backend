@@ -1,8 +1,9 @@
+import os
 import requests
 import json
 
 class AICBTAPI:
-    def __init__(self, base_url="http://localhost:5001/api/v1", api_key="dev_key_123"):
+    def __init__(self, base_url="http://localhost:5001/api/v1", api_key=os.environ.get("LEXAI_API_KEY", "")):
         self.base_url = base_url
         self.headers = {
             "X-API-Key": api_key,

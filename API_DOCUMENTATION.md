@@ -26,8 +26,8 @@ All API endpoints (except `/api/v1/health` and `/api/v1/docs`) require authentic
 
 ### Available API Keys (Development)
 
-- **Development**: `dev_key_123`
-- **Testing**: `test_key_789`
+- **Development**: `YOUR_API_KEY`
+- **Testing**: `YOUR_API_KEY`
 
 For production use, please generate your own API keys through the admin panel.
 
@@ -74,7 +74,7 @@ Score a student answer against a marking guide using AI.
 
 **Headers:**
 ```
-X-API-Key: dev_key_123
+X-API-Key: YOUR_API_KEY
 Content-Type: application/json
 ```
 
@@ -112,7 +112,7 @@ Retrieve all available assessment questions.
 
 **Headers:**
 ```
-X-API-Key: dev_key_123
+X-API-Key: YOUR_API_KEY
 ```
 
 **Response:**
@@ -139,7 +139,7 @@ Create a new assessment question.
 
 **Headers:**
 ```
-X-API-Key: dev_key_123
+X-API-Key: YOUR_API_KEY
 Content-Type: application/json
 ```
 
@@ -169,7 +169,7 @@ Create a new student or retrieve existing student information.
 
 **Headers:**
 ```
-X-API-Key: dev_key_123
+X-API-Key: YOUR_API_KEY
 Content-Type: application/json
 ```
 
@@ -205,7 +205,7 @@ Submit and automatically score a student response.
 
 **Headers:**
 ```
-X-API-Key: dev_key_123
+X-API-Key: YOUR_API_KEY
 Content-Type: application/json
 ```
 
@@ -246,7 +246,7 @@ Retrieve all responses for a specific student.
 
 **Headers:**
 ```
-X-API-Key: dev_key_123
+X-API-Key: YOUR_API_KEY
 ```
 
 **Response:**
@@ -320,7 +320,7 @@ import json
 
 # Configuration
 API_BASE = "http://localhost:5001/api/v1"
-API_KEY = "dev_key_123"
+API_KEY = "YOUR_API_KEY"
 
 headers = {
     "X-API-Key": API_KEY,
@@ -371,7 +371,7 @@ print(f"Feedback: {result['scoring']['feedback']}")
 const axios = require('axios');
 
 const API_BASE = 'http://localhost:5001/api/v1';
-const API_KEY = 'dev_key_123';
+const API_KEY = 'YOUR_API_KEY';
 
 const headers = {
     'X-API-Key': API_KEY,
@@ -410,7 +410,7 @@ curl -X GET "http://localhost:5001/api/v1/health"
 
 # Score an answer
 curl -X POST "http://localhost:5001/api/v1/score" \
-  -H "X-API-Key: dev_key_123" \
+  -H "X-API-Key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "student_answer": "Gravity is a force that pulls objects toward Earth.",
@@ -420,7 +420,7 @@ curl -X POST "http://localhost:5001/api/v1/score" \
 
 # Get all questions
 curl -X GET "http://localhost:5001/api/v1/questions" \
-  -H "X-API-Key: dev_key_123"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 ## Use Cases

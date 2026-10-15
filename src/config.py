@@ -5,7 +5,7 @@ import os
 
 class Config:
     # Flask configuration
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'a4cb44f1bd507ee6f856d6977ffacc60'
+    SECRET_KEY = os.environ.get('SECRET_KEY')
     
     # AI Service API Keys (set these as environment variables in production)
     OLLAMA_API_KEY = os.environ.get('OLLAMA_API_KEY') or ''
@@ -19,7 +19,7 @@ class Config:
     COHERE_MODEL = os.environ.get('COHERE_MODEL') or 'command'
     HUGGINGFACE_MODEL = os.environ.get('HUGGINGFACE_MODEL') or 'google/flan-t5-base'
     
-    # Database configuration
+    # Database configuration (src/database.py reads the same variable)
     DATABASE_URL = os.environ.get('DATABASE_URL') or 'sqlite:///data/database.db'
     
     # Upload configuration
@@ -48,5 +48,5 @@ config = {
     'development': DevelopmentConfig,
     'production': ProductionConfig,
     'testing': TestingConfig,
-    'default': DevelopmentConfig
+    'default': ProductionConfig
 }

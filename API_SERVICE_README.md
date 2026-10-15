@@ -65,8 +65,8 @@ X-API-Key: YOUR_API_KEY_HERE
 ```
 
 For testing purposes, you can use these development keys:
-- `dev_key_123` - Development key
-- `test_key_789` - Testing key
+- `YOUR_API_KEY` - Development key
+- `YOUR_API_KEY` - Testing key
 
 ### Core Endpoints
 
@@ -205,7 +205,7 @@ import requests
 # Set up the API client
 base_url = "http://localhost:5001/api/v1"
 headers = {
-    "X-API-Key": "dev_key_123",
+    "X-API-Key": "YOUR_API_KEY",
     "Content-Type": "application/json"
 }
 
@@ -234,7 +234,7 @@ const axios = require('axios');
 const api = axios.create({
   baseURL: 'http://localhost:5001/api/v1',
   headers: {
-    'X-API-Key': 'dev_key_123',
+    'X-API-Key': 'YOUR_API_KEY',
     'Content-Type': 'application/json'
   }
 });
