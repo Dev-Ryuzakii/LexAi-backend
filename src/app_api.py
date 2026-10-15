@@ -29,7 +29,7 @@ def add_security_headers(response):
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024  # 1 MB request bodies
+    app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB request bodies (file uploads)
 
     if _flag('TRUST_PROXY'):
         # Behind one reverse proxy: take the client IP from X-Forwarded-For for IP rate limits.
@@ -37,7 +37,8 @@ def create_app() -> Flask:
 
     origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', 'http://localhost:3000').split(',') if o.strip()]
     CORS(app, resources={r'/api/*': {'origins': origins}},
-         expose_headers=['X-RateLimit-Limit', 'X-RateLimit-Used', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'X-Request-ID'])
+         expose_headers=['X-RateLimit-Limit', 'X-RateLimit-Used', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'X-Request-ID',
+                         'Retry-After', 'Idempotent-Replayed', 'Content-Disposition'])
 
     app.after_request(add_security_headers)
     register_api_routes(app)

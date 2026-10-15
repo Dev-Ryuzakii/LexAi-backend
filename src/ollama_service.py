@@ -4,12 +4,11 @@ Ollama service module for AI-powered answer scoring
 import requests
 import logging
 import os
-import random
 import time
 import hashlib
 from datetime import datetime
-from typing import Dict, Any
 
+from resilience import retry_call
 from scoring import StrictScoringMixin, MAX_SCORE
 
 logger = logging.getLogger(__name__)
@@ -155,31 +154,29 @@ Respond only with the JSON object, no additional text.
             }
         }
 
-        last_error = None
-        for attempt in range(self.retries + 1):
+        def attempt() -> str:
             start_time = time.time()
             try:
                 response = requests.post(self.api_url, json=payload, timeout=self.timeout)
-                if response.status_code == 404:
-                    # Retrying will not make a missing model appear.
-                    raise RuntimeError(f"Model {self.model} not found on Ollama server")
-                response.raise_for_status()
-                logger.info(f"Ollama API call completed in {time.time() - start_time:.2f}s")
-                return response.json().get("response", "")
-            except RuntimeError:
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                self.health_status["healthy"] = False
+                self.health_status["error"] = type(e).__name__
                 raise
-            except requests.exceptions.RequestException as e:
-                last_error = e
-                logger.error(f"Ollama call failed (attempt {attempt + 1}/{self.retries + 1}): {e}")
-                if isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-                    self.health_status["healthy"] = False
-                    self.health_status["error"] = type(e).__name__
+            if response.status_code == 404:
+                raise RuntimeError(f"Model {self.model} not found on Ollama server")
+            response.raise_for_status()
+            logger.info(f"Ollama API call completed in {time.time() - start_time:.2f}s")
+            return response.json().get("response", "")
 
-            if attempt < self.retries:
-                delay = 2 ** attempt
-                time.sleep(delay + random.uniform(0, delay * 0.5))
+        def transient(e: BaseException) -> bool:
+            # Network problems, 429 and 5xx are worth retrying; other client errors are not.
+            if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+                return e.response.status_code == 429 or e.response.status_code >= 500
+            return isinstance(e, requests.exceptions.RequestException)
 
-        raise RuntimeError(f"All Ollama call attempts failed: {last_error}")
+        return retry_call(attempt, attempts=self.retries + 1, base=1.0, cap=10.0,
+                          retry_on=(requests.exceptions.RequestException,), should_retry=transient,
+                          label='Ollama call')
 
     def get_available_models(self) -> list:
         try:
