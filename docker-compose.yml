@@ -1,29 +1,30 @@
-version: '3.8'
-
 services:
-  # Redis for rate limiting
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
 
-  # Main AI-CBT API service
-  ai-cbt-api:
+  lexai-api:
     build: .
     ports:
       - "5001:5001"
     depends_on:
       - redis
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - FLASK_ENV=production
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/database.db}
+      # Ollama running on the host machine
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ./logs:/app/logs
       - ./data:/app/data
+      - ./logs:/app/logs
     restart: unless-stopped
 
 volumes:

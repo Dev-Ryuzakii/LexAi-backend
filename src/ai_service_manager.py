@@ -1,11 +1,16 @@
 """
-AI Service Manager for handling multiple AI providers
+AI Service Manager for handling multiple AI providers.
+
+score_answer() either returns a grade or a result with scoring_method == "unavailable".
+Grades that should not be trusted without a human (low confidence, text-similarity
+fallback) carry needs_review=True.
 """
 import logging
-from typing import Dict, Any, Optional
+import os
+from typing import Dict, Any
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+from scoring import MAX_SCORE, ScoringError
+
 logger = logging.getLogger(__name__)
 
 # Try to import optional dependencies
@@ -34,14 +39,14 @@ except ImportError as e:
     logger.warning(f"Hugging Face service not available: {e}")
     huggingface_service = None
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 class AIServiceManager:
     def __init__(self):
-        """
-        Initialize AI Service Manager with all available services
-        """
         self.services = {}
-        
-        # Only add services that are available
         if ollama_service:
             self.services['ollama'] = ollama_service
         if palm_service:
@@ -50,180 +55,114 @@ class AIServiceManager:
             self.services['cohere'] = cohere_service
         if huggingface_service:
             self.services['huggingface'] = huggingface_service
-            
-        # Set default active service
-        if self.services:
-            self.active_service = next(iter(self.services))
-        else:
-            self.active_service = None
-            
+
+        self.active_service = next(iter(self.services), None)
         self.fallback_chain = [s for s in ['ollama', 'palm', 'cohere', 'huggingface'] if s in self.services]
-        
+        self.review_confidence_threshold = float(os.environ.get('REVIEW_CONFIDENCE_THRESHOLD', '0.6'))
+        self.allow_similarity_fallback = _env_flag('ALLOW_SIMILARITY_FALLBACK', True)
+
     def set_active_service(self, service_name: str) -> bool:
-        """
-        Set the active AI service to use
-        
-        Args:
-            service_name: Name of the service to activate
-            
-        Returns:
-            Boolean indicating if the service was successfully set
-        """
         if service_name in self.services:
             self.active_service = service_name
             logger.info(f"Active AI service set to: {service_name}")
             return True
-        else:
-            logger.error(f"Service {service_name} not found. Available services: {list(self.services.keys())}")
-            return False
-    
+        logger.error(f"Service {service_name} not found. Available services: {list(self.services.keys())}")
+        return False
+
     def set_api_keys(self, api_keys: Dict[str, str]) -> None:
-        """
-        Set API keys for the services that require them
-        
-        Args:
-            api_keys: Dictionary with service names as keys and API keys as values
-        """
         for service_name, api_key in api_keys.items():
-            if service_name in self.services:
-                if hasattr(self.services[service_name], 'api_key'):
-                    self.services[service_name].api_key = api_key
-                    logger.info(f"API key set for {service_name}")
-                else:
-                    logger.warning(f"Service {service_name} does not support API keys")
-            else:
-                logger.warning(f"Unknown service {service_name}")
-    
-    def set_models(self, models: Dict[str, str]) -> None:
-        """
-        Set models for the services
-        
-        Args:
-            models: Dictionary with service names as keys and model names as values
-        """
-        for service_name, model in models.items():
-            if service_name in self.services:
-                if hasattr(self.services[service_name], 'model'):
-                    self.services[service_name].model = model
-                    logger.info(f"Model set for {service_name}: {model}")
-                else:
-                    logger.warning(f"Service {service_name} does not support model selection")
-            else:
-                logger.warning(f"Unknown service {service_name}")
-    
-    def score_answer(self, student_answer: str, marking_guide: str, question: str = "") -> Dict[str, Any]:
-        """
-        Score a student answer using the active service or fallback chain
-        
-        Args:
-            student_answer: The student's answer
-            marking_guide: The correct answer/marking guide
-            question: The original question (optional for context)
-            
-        Returns:
-            Dictionary containing score, feedback and metadata
-        """
-        # Input validation
-        if not student_answer or not marking_guide:
-            return {
-                "score": 0,
-                "confidence": 0.0,
-                "feedback": "Missing student answer or marking guide",
-                "strengths": [],
-                "weaknesses": [],
-                "model_used": "none",
-                "scoring_method": "error"
-            }
-        
-        # Check if any services are available
-        if not self.services:
-            return {
-                "score": 0,
-                "confidence": 0.0,
-                "feedback": "No AI services available",
-                "strengths": [],
-                "weaknesses": [],
-                "model_used": "none",
-                "scoring_method": "unavailable"
-            }
-        
-        # Try the active service first
-        service_order = [self.active_service] + [s for s in self.fallback_chain if s != self.active_service]
-        
-        for service_name in service_order:
             service = self.services.get(service_name)
-            if not service:
+            if service is not None and hasattr(service, 'api_key'):
+                service.api_key = api_key
+                logger.info(f"API key set for {service_name}")
+            else:
+                logger.warning(f"Cannot set API key for {service_name}")
+
+    def set_models(self, models: Dict[str, str]) -> None:
+        for service_name, model in models.items():
+            service = self.services.get(service_name)
+            if service is not None and hasattr(service, 'model'):
+                service.model = model
+                logger.info(f"Model set for {service_name}: {model}")
+            else:
+                logger.warning(f"Cannot set model for {service_name}")
+
+    @staticmethod
+    def _unavailable(reason: str) -> Dict[str, Any]:
+        return {
+            "score": None,
+            "confidence": 0.0,
+            "feedback": reason,
+            "strengths": [],
+            "weaknesses": [],
+            "model_used": "none",
+            "scoring_method": "unavailable",
+            "error": reason,
+        }
+
+    def score_answer(self, student_answer: str, marking_guide: str, question: str = "") -> Dict[str, Any]:
+        if not student_answer or not marking_guide:
+            return self._unavailable("Missing student answer or marking guide")
+
+        service_order = []
+        if self.active_service:
+            service_order.append(self.active_service)
+        service_order += [s for s in self.fallback_chain if s != self.active_service]
+
+        errors = []
+        for service_name in service_order:
+            service = self.services[service_name]
+            if service_name != 'ollama' and not getattr(service, 'api_key', None):
                 continue
-                
             try:
-                # Check if service is configured (has API key if needed)
-                if hasattr(service, 'api_key') and service_name in ['palm', 'cohere', 'huggingface']:
-                    if not getattr(service, 'api_key', None):
-                        logger.warning(f"Skipping {service_name} - no API key configured")
-                        continue
-                
-                # Check service health
-                if service.check_connection():
-                    result = service.score_answer(student_answer, marking_guide, question)
-                    result["scoring_method"] = service_name
-                    logger.info(f"Scored using {service_name}")
-                    return result
-                else:
-                    logger.warning(f"{service_name} service unavailable")
-            except Exception as e:
-                logger.error(f"Error using {service_name} service: {e}")
+                if not service.check_connection():
+                    errors.append(f"{service_name}: unavailable")
+                    continue
+                result = service.score_answer(student_answer, marking_guide, question)
+            except ScoringError as e:
+                logger.error(f"{service_name} could not grade: {e}")
+                errors.append(f"{service_name}: {e}")
                 continue
-        
-        # Ultimate fallback - simple similarity if available
-        if fallback_similarity_score:
+            except Exception as e:
+                logger.exception(f"Unexpected error from {service_name}")
+                errors.append(f"{service_name}: {e}")
+                continue
+
+            result["scoring_method"] = service_name
+            result["max_score"] = MAX_SCORE
+            result["needs_review"] = result.get("confidence", 0.0) < self.review_confidence_threshold
+            return result
+
+        if self.allow_similarity_fallback and fallback_similarity_score:
             score = fallback_similarity_score(student_answer, marking_guide)
-            logger.info("Scored using simple similarity fallback")
+            logger.warning("No AI provider could grade; using text-similarity estimate flagged for review")
             return {
                 "score": score,
-                "confidence": 0.5,
-                "feedback": "Scored using simple text similarity (basic fallback)",
+                "confidence": 0.3,
+                "feedback": "Estimated with text similarity because no AI provider was available. A lecturer should review this score.",
                 "strengths": [],
                 "weaknesses": [],
                 "model_used": "basic_similarity",
-                "scoring_method": "basic_similarity"
+                "scoring_method": "basic_similarity",
+                "max_score": MAX_SCORE,
+                "needs_review": True,
+                "cached": False,
+                "provider_errors": errors,
             }
-        else:
-            # Final fallback - return a default response
-            logger.info("No scoring methods available, returning default response")
-            return {
-                "score": 0,
-                "confidence": 0.0,
-                "feedback": "No scoring methods available",
-                "strengths": [],
-                "weaknesses": [],
-                "model_used": "none",
-                "scoring_method": "unavailable"
-            }
-    
+
+        return self._unavailable("No AI provider could grade this answer" + (f" ({'; '.join(errors)})" if errors else ""))
+
     def get_service_status(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get the status of all AI services
-        
-        Returns:
-            Dictionary with service statuses
-        """
         status = {}
         for name, service in self.services.items():
             try:
                 connected = service.check_connection()
-                status[name] = {
-                    "connected": connected,
-                    "healthy": getattr(service.health_status, 'healthy', False) if hasattr(service, 'health_status') else connected,
-                    "model": getattr(service, 'model', 'unknown') if hasattr(service, 'model') else 'N/A'
-                }
+                health = getattr(service, 'health_status', None)
+                healthy = health.get('healthy', connected) if isinstance(health, dict) else getattr(health, 'healthy', connected)
+                status[name] = {"connected": connected, "healthy": healthy, "model": getattr(service, 'model', 'N/A')}
             except Exception as e:
-                status[name] = {
-                    "connected": False,
-                    "healthy": False,
-                    "error": str(e),
-                    "model": getattr(service, 'model', 'unknown') if hasattr(service, 'model') else 'N/A'
-                }
+                status[name] = {"connected": False, "healthy": False, "error": str(e), "model": getattr(service, 'model', 'N/A')}
         return status
 
-# Create a global instance
+
 ai_service_manager = AIServiceManager()

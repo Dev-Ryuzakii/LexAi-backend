@@ -27,7 +27,6 @@ def run_migrations():
     # Create Alembic config
     alembic_cfg = Config(alembic_ini_path)
     alembic_cfg.set_main_option("script_location", os.path.join(project_root, "migrations"))
-    alembic_cfg.set_main_option("sqlalchemy.url", "sqlite:///data/database.db")
     
     try:
         # Run migrations

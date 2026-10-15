@@ -1,28 +1,21 @@
-# Use Python 3.9 slim image
-FROM python:3.9-slim
+FROM python:3.12-slim
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Copy requirements file
 COPY requirements.txt .
-
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install system dependencies for NLTK
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+COPY alembic.ini ./
+COPY migrations ./migrations
+COPY src ./src
 
-# Copy application code
-COPY . .
+RUN useradd --create-home lexai && mkdir -p data logs && chown -R lexai /app
+USER lexai
 
-# Create logs directory
-RUN mkdir -p logs
-
-# Expose port
 EXPOSE 5001
 
-# Run the application
-CMD ["python", "src/app_api.py"]
+# Apply migrations, then serve with gunicorn (never the Flask debug server).
+CMD ["sh", "-c", "alembic upgrade head && exec gunicorn --chdir src --bind 0.0.0.0:5001 --workers ${GUNICORN_WORKERS:-2} --timeout 120 app_api:app"]

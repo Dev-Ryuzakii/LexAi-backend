@@ -1,12 +1,18 @@
 __pycache__/
 *.pyc
-*.pyc.backup
 *.backup
 .env
 venv/
-logs/*.log
+.venv/
+.pytest_cache/
+
+# Runtime data: never commit databases, logs or backups
+*.db
+*.sqlite
+*.log
+logs/
+data/*.db
+test_backup/
 backup.log
 cookies.txt
 src/secrets
-src/data/*.db
-test_backup/

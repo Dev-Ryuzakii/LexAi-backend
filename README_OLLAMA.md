@@ -72,7 +72,7 @@ Once the service is running, you can test the Ollama integration through the API
 
 ```bash
 curl -X POST http://localhost:5001/api/v1/responses/score \
-  -H "X-API-Key: dev_key_123" \
+  -H "X-API-Key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "student_answer": "Gravity is the force that pulls objects toward the Earth.",
