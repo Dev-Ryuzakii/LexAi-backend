@@ -18,4 +18,5 @@ USER lexai
 EXPOSE 5001
 
 # Apply migrations, then serve with gunicorn (never the Flask debug server).
-CMD ["sh", "-c", "alembic upgrade head && exec gunicorn --chdir src --bind 0.0.0.0:5001 --workers ${GUNICORN_WORKERS:-2} --timeout 120 app_api:app"]
+# The timeout covers question generation, which makes several model calls (see GENERATION_TIME_BUDGET_SECONDS).
+CMD ["sh", "-c", "alembic upgrade head && exec gunicorn --chdir src --bind 0.0.0.0:5001 --workers ${GUNICORN_WORKERS:-2} --timeout ${GUNICORN_TIMEOUT:-600} app_api:app"]

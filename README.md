@@ -55,6 +55,23 @@ unique within one owner's records, not across all owners.
 - A student's `score` is always the sum of their graded responses. It is recalculated in the same transaction whenever a response is created, rescored or deleted, and it can't be set directly.
 - Model output becomes a grade only if it is valid JSON with a whole-number score from 0 to 5. Anything else is retried once and then treated as a failure.
 
+## Reliability
+
+- **Retries with jitter.** Calls to AI providers and webhook deliveries are retried on network errors, 429 and 5xx, using exponential backoff with full jitter (a random wait up to the backoff cap), so retries from many requests do not arrive at the same moment. Errors that cannot succeed on retry, such as other 4xx responses or a missing model, are not retried.
+- **Circuit breaker.** If an AI provider fails `PROVIDER_FAILURE_THRESHOLD` times in a row, it is skipped for `PROVIDER_COOLDOWN_SECONDS`, after which one trial request is allowed through. `/health` shows each provider's circuit state.
+- **Idempotency.** Send an `Idempotency-Key` header on create endpoints (`/score`, `/score/batch`, `/submit-response`, `/questions`, `/students`, `/responses`, `/api-keys`, `/api-keys/{id}/rotate`, `/webhooks`, `/bulk/*`). Retrying with the same key and body within 24 hours returns the first response (with `Idempotent-Replayed: true`) instead of running the request again. Reusing a key with a different body returns `422`. 5xx responses are not stored, so those requests can be retried.
+- **Retry-After.** Every 429 and 503 response includes `Retry-After` (in seconds).
+- **SQLite busy timeout.** Concurrent writers wait up to 15 seconds for the lock instead of failing.
+
+## Webhooks
+
+Deliveries are `POST` requests with the body `{id, event, timestamp, data}` and these headers:
+`X-LexAi-Event`, `X-LexAi-Delivery`, `X-LexAi-Timestamp`, and
+`X-LexAi-Signature: sha256=<HMAC-SHA256(secret, "<timestamp>.<body>")>`. Verify the signature and
+reject old timestamps. Events: `scoring.complete`, `quota.warning` (80%), `quota.exceeded`,
+`api_key.rotated`, `api_key.revoked`, `error.occurred`. Targets must use https and resolve to public
+addresses. Redirects are not followed.
+
 ## Limits
 
 | Limit | Default | Applies to |
@@ -88,6 +105,20 @@ All paths are under `/api/v1`.
 | GET/POST | `/api-keys` | Needs a session |
 | DELETE | `/api-keys/{id}` | Revokes the key |
 | POST | `/api-keys/{id}/rotate` | Revokes the old key and returns a new one |
+| GET/POST | `/api-keys/{id}/ip-rules` | Allow/deny IPs or CIDR ranges for a key. Needs a session |
+| DELETE | `/api-keys/{id}/ip-rules/{rule_id}` | |
+| POST | `/score/batch` | Up to 100 answers, graded in parallel. `?async=true` returns a job id |
+| GET | `/jobs/{id}` | Status and result of a background job |
+| GET | `/analytics/quota`, `/stats`, `/timeline`, `/top-endpoints`, `/compare`, `/export` | Usage analytics. Sessions see all of the account's traffic; an API key sees its own |
+| GET/POST | `/webhooks` | Signed event deliveries |
+| DELETE | `/webhooks/{id}` | |
+| POST | `/bulk/questions`, `/bulk/students` | Up to 500 items; failures reported per item |
+| PUT | `/bulk/questions/update` | |
+| POST | `/bulk/questions/delete` | Recalculates affected student totals |
+| POST | `/upload/questions`, `/upload/students` | `.csv` or `.json` file in the `file` form field, up to 1000 rows |
+| GET | `/export/questions`, `/export/students`, `/export/responses` | `?format=csv` or `json` |
+| GET | `/changelog`, `/changelog/breaking-changes`, `/changelog/deprecations` | No auth |
+| GET | `/openapi.json`, `/openapi.yaml` | No auth. Generated from the registered routes |
 
 Errors use one shape:
 

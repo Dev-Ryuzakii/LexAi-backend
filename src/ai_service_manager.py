@@ -7,8 +7,11 @@ fallback) carry needs_review=True.
 """
 import logging
 import os
-from typing import Dict, Any
+from typing import Any, Dict, List, Tuple
 
+import generation
+from generation import GenerationUnavailable
+from resilience import CircuitBreaker
 from scoring import MAX_SCORE, ScoringError
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,10 @@ class AIServiceManager:
         self.fallback_chain = [s for s in ['ollama', 'palm', 'cohere', 'huggingface'] if s in self.services]
         self.review_confidence_threshold = float(os.environ.get('REVIEW_CONFIDENCE_THRESHOLD', '0.6'))
         self.allow_similarity_fallback = _env_flag('ALLOW_SIMILARITY_FALLBACK', True)
+        # A provider that fails this many times in a row is skipped for breaker_reset seconds.
+        self.breaker_threshold = int(os.environ.get('PROVIDER_FAILURE_THRESHOLD', '3'))
+        self.breaker_reset = float(os.environ.get('PROVIDER_COOLDOWN_SECONDS', '60'))
+        self.breakers: Dict[str, CircuitBreaker] = {}
 
     def set_active_service(self, service_name: str) -> bool:
         if service_name in self.services:
@@ -114,16 +121,24 @@ class AIServiceManager:
             service = self.services[service_name]
             if service_name != 'ollama' and not getattr(service, 'api_key', None):
                 continue
+            breaker = self._breaker(service_name)
+            if not breaker.allow():
+                errors.append(f"{service_name}: skipped (circuit open after repeated failures)")
+                continue
             try:
                 if not service.check_connection():
+                    breaker.record_failure()
                     errors.append(f"{service_name}: unavailable")
                     continue
                 result = service.score_answer(student_answer, marking_guide, question)
+                breaker.record_success()
             except ScoringError as e:
+                breaker.record_failure()
                 logger.error(f"{service_name} could not grade: {e}")
                 errors.append(f"{service_name}: {e}")
                 continue
             except Exception as e:
+                breaker.record_failure()
                 logger.exception(f"Unexpected error from {service_name}")
                 errors.append(f"{service_name}: {e}")
                 continue
@@ -152,6 +167,66 @@ class AIServiceManager:
 
         return self._unavailable("No AI provider could grade this answer" + (f" ({'; '.join(errors)})" if errors else ""))
 
+    def _breaker(self, service_name: str) -> CircuitBreaker:
+        return self.breakers.setdefault(service_name, CircuitBreaker(
+            service_name, failure_threshold=self.breaker_threshold, reset_timeout=self.breaker_reset))
+
+    def generation_providers(self) -> List[str]:
+        """Providers that can write questions (long JSON output): those with complete()."""
+        order = ([self.active_service] if self.active_service else []) +             [s for s in self.fallback_chain if s != self.active_service]
+        names = []
+        for name in order:
+            service = self.services.get(name)
+            if service is None or not callable(getattr(service, 'complete', None)):
+                continue
+            if name != 'ollama' and not getattr(service, 'api_key', None):
+                continue
+            names.append(name)
+        return names
+
+    def generate_questions(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate questions for `spec` (see generation.generate). Each model call tries the
+        capable providers in order with the same circuit breakers as grading; there is no
+        non-AI fallback. Raises GenerationUnavailable / GenerationFailed.
+        """
+        providers = self.generation_providers()
+        if not providers:
+            raise GenerationUnavailable('No question-generation provider is configured')
+        used: List[Tuple[str, str]] = []
+
+        def call(prompt: str) -> str:
+            errors = []
+            for name in providers:
+                service = self.services[name]
+                breaker = self._breaker(name)
+                if not breaker.allow():
+                    errors.append(f"{name}: skipped (circuit open after repeated failures)")
+                    continue
+                try:
+                    if not service.check_connection():
+                        breaker.record_failure()
+                        errors.append(f"{name}: unavailable")
+                        continue
+                    text = service.complete(prompt, max_tokens=generation.MAX_TOKENS,
+                                            temperature=generation.TEMPERATURE)
+                except Exception as e:
+                    breaker.record_failure()
+                    logger.exception(f"{name} could not generate questions")
+                    errors.append(f"{name}: {e}")
+                    continue
+                breaker.record_success()
+                entry = (name, getattr(service, 'model', 'unknown'))
+                if entry not in used:
+                    used.append(entry)
+                return text
+            raise GenerationUnavailable('; '.join(errors) or 'No provider could generate questions')
+
+        result = generation.generate(spec, call)
+        result['provider'] = ','.join(name for name, _ in used)
+        result['model_used'] = ','.join(model for _, model in used)
+        return result
+
     def get_service_status(self) -> Dict[str, Dict[str, Any]]:
         status = {}
         for name, service in self.services.items():
@@ -159,7 +234,9 @@ class AIServiceManager:
                 connected = service.check_connection()
                 health = getattr(service, 'health_status', None)
                 healthy = health.get('healthy', connected) if isinstance(health, dict) else getattr(health, 'healthy', connected)
-                status[name] = {"connected": connected, "healthy": healthy, "model": getattr(service, 'model', 'N/A')}
+                breaker = self.breakers.get(name)
+                status[name] = {"connected": connected, "healthy": healthy, "model": getattr(service, 'model', 'N/A'),
+                                "circuit": breaker.state if breaker else 'closed'}
             except Exception as e:
                 status[name] = {"connected": False, "healthy": False, "error": str(e), "model": getattr(service, 'model', 'N/A')}
         return status
