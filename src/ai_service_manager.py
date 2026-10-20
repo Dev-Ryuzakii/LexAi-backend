@@ -7,8 +7,10 @@ fallback) carry needs_review=True.
 """
 import logging
 import os
-from typing import Dict, Any
+from typing import Any, Dict, List, Tuple
 
+import generation
+from generation import GenerationUnavailable
 from resilience import CircuitBreaker
 from scoring import MAX_SCORE, ScoringError
 
@@ -119,8 +121,7 @@ class AIServiceManager:
             service = self.services[service_name]
             if service_name != 'ollama' and not getattr(service, 'api_key', None):
                 continue
-            breaker = self.breakers.setdefault(service_name, CircuitBreaker(
-                service_name, failure_threshold=self.breaker_threshold, reset_timeout=self.breaker_reset))
+            breaker = self._breaker(service_name)
             if not breaker.allow():
                 errors.append(f"{service_name}: skipped (circuit open after repeated failures)")
                 continue
@@ -165,6 +166,66 @@ class AIServiceManager:
             }
 
         return self._unavailable("No AI provider could grade this answer" + (f" ({'; '.join(errors)})" if errors else ""))
+
+    def _breaker(self, service_name: str) -> CircuitBreaker:
+        return self.breakers.setdefault(service_name, CircuitBreaker(
+            service_name, failure_threshold=self.breaker_threshold, reset_timeout=self.breaker_reset))
+
+    def generation_providers(self) -> List[str]:
+        """Providers that can write questions (long JSON output): those with complete()."""
+        order = ([self.active_service] if self.active_service else []) +             [s for s in self.fallback_chain if s != self.active_service]
+        names = []
+        for name in order:
+            service = self.services.get(name)
+            if service is None or not callable(getattr(service, 'complete', None)):
+                continue
+            if name != 'ollama' and not getattr(service, 'api_key', None):
+                continue
+            names.append(name)
+        return names
+
+    def generate_questions(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate questions for `spec` (see generation.generate). Each model call tries the
+        capable providers in order with the same circuit breakers as grading; there is no
+        non-AI fallback. Raises GenerationUnavailable / GenerationFailed.
+        """
+        providers = self.generation_providers()
+        if not providers:
+            raise GenerationUnavailable('No question-generation provider is configured')
+        used: List[Tuple[str, str]] = []
+
+        def call(prompt: str) -> str:
+            errors = []
+            for name in providers:
+                service = self.services[name]
+                breaker = self._breaker(name)
+                if not breaker.allow():
+                    errors.append(f"{name}: skipped (circuit open after repeated failures)")
+                    continue
+                try:
+                    if not service.check_connection():
+                        breaker.record_failure()
+                        errors.append(f"{name}: unavailable")
+                        continue
+                    text = service.complete(prompt, max_tokens=generation.MAX_TOKENS,
+                                            temperature=generation.TEMPERATURE)
+                except Exception as e:
+                    breaker.record_failure()
+                    logger.exception(f"{name} could not generate questions")
+                    errors.append(f"{name}: {e}")
+                    continue
+                breaker.record_success()
+                entry = (name, getattr(service, 'model', 'unknown'))
+                if entry not in used:
+                    used.append(entry)
+                return text
+            raise GenerationUnavailable('; '.join(errors) or 'No provider could generate questions')
+
+        result = generation.generate(spec, call)
+        result['provider'] = ','.join(name for name, _ in used)
+        result['model_used'] = ','.join(model for _, model in used)
+        return result
 
     def get_service_status(self) -> Dict[str, Dict[str, Any]]:
         status = {}

@@ -11,6 +11,14 @@ from flask import current_app, jsonify, make_response, request
 
 CHANGELOG = [
     {
+        'version': '1.3.0',
+        'date': '2026-10-20',
+        'changes': [
+            {'type': 'added', 'category': 'generation', 'description': 'AI question generation: MCQ, fill-in-the-blank and theory questions with answer keys, marking guides and explanations.',
+             'endpoints': ['/generate-questions']},
+        ],
+    },
+    {
         'version': '1.2.0',
         'date': '2026-10-15',
         'changes': [
@@ -150,7 +158,7 @@ def build_openapi(app) -> Dict[str, Any]:
     return {
         'openapi': '3.0.3',
         'info': {'title': 'LexAi API', 'version': API_VERSION,
-                 'description': 'AI-assisted grading for computer-based tests.'},
+                 'description': 'AI-assisted grading and question generation for computer-based tests.'},
         'servers': [{'url': request.host_url.rstrip('/') + '/api/v1'}],
         'components': {
             'securitySchemes': {

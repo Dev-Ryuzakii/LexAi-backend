@@ -46,6 +46,14 @@ class CohereService(StrictScoringMixin):
         response = self.client.generate(model=self.model, prompt=prompt, max_tokens=500, temperature=0.1)
         return response.generations[0].text
 
+    def complete(self, prompt: str, max_tokens: int = 2500, temperature: float = 0.4) -> str:
+        """Long-form generation (question writing); grading keeps its own settings above."""
+        if not self.client:
+            raise RuntimeError("Cohere client is not connected")
+        response = self.client.generate(model=self.model, prompt=prompt, max_tokens=max_tokens,
+                                        temperature=temperature)
+        return response.generations[0].text
+
 
 cohere_service = CohereService(
     api_key=os.environ.get("COHERE_API_KEY", ""),

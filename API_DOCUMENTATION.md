@@ -278,6 +278,148 @@ X-API-Key: YOUR_API_KEY
 }
 ```
 
+### 8. Generate Questions
+```http
+POST /api/v1/generate-questions
+```
+Generate exam questions (multiple choice, fill-in-the-blank and theory) with answer keys, marking guides
+and explanations, for a teacher to preview, edit and publish. Nothing is stored.
+
+Only providers that can write long structured output are used: Ollama (default model `llama3.2:latest`)
+and Cohere (when `COHERE_API_KEY` is set). There is no non-AI fallback.
+
+**Headers:**
+```
+X-API-Key: YOUR_API_KEY
+Content-Type: application/json
+Idempotency-Key: optional-unique-key   (recommended: retries replay the first result)
+```
+
+**Request Body:**
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `subject` | string | yes | at most 200 characters |
+| `topics` | string[] | yes | 1-10 items, each at most 200 characters |
+| `level` | string | no | at most 100 characters, e.g. `"JSS 2"`, `"SS 3"`, `"100 Level"` |
+| `count` | integer | yes | 1-30 |
+| `question_types` | string[] | yes | non-empty subset of `MCQ`, `FILL_BLANK`, `THEORY` |
+| `difficulty` | string | no | `easy`, `medium`, `hard` or `mixed` (default `mixed`) |
+| `instructions` | string | no | teacher's extra guidance, at most 2000 characters |
+| `source_material` | string | no | notes to base the questions on, at most 20000 characters |
+| `avoid_questions` | string[] | no | existing questions not to duplicate; at most 100 items, each at most 1000 characters |
+
+```json
+{
+  "subject": "Basic Science",
+  "topics": ["Photosynthesis", "Plant cells"],
+  "level": "JSS 2",
+  "count": 10,
+  "question_types": ["MCQ", "FILL_BLANK", "THEORY"],
+  "difficulty": "mixed",
+  "instructions": "Use everyday Nigerian examples where possible.",
+  "avoid_questions": ["What is photosynthesis?"]
+}
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "request_id": "uuid-here",
+  "timestamp": "2026-10-20T10:00:00",
+  "processing_time": 41.27,
+  "model_used": "llama3.2:latest",
+  "provider": "ollama",
+  "data": {
+    "requested": 10,
+    "generated": 10,
+    "warnings": [],
+    "questions": [
+      {
+        "type": "MCQ",
+        "question_text": "Which part of a plant cell contains chlorophyll?",
+        "options": ["Chloroplast", "Nucleus", "Cell wall", "Vacuole"],
+        "correct_answer": "Chloroplast",
+        "accepted_answers": [],
+        "marking_guide": "Chloroplasts contain chlorophyll, the pigment that absorbs light.",
+        "explanation": "Chlorophyll is found in chloroplasts. The nucleus controls the cell, the cell wall gives support and the vacuole stores cell sap.",
+        "difficulty": "easy",
+        "topic": "Plant cells",
+        "learning_objective": "Identify the organelle that contains chlorophyll.",
+        "common_mistakes": ["Thinking the nucleus carries out photosynthesis"],
+        "suggested_points": 1
+      },
+      {
+        "type": "FILL_BLANK",
+        "question_text": "The gas released by plants during photosynthesis is ____.",
+        "options": [],
+        "correct_answer": "oxygen",
+        "accepted_answers": ["oxygen", "O2"],
+        "marking_guide": "Photosynthesis splits water and releases oxygen.",
+        "explanation": "Plants take in carbon dioxide and give out oxygen during photosynthesis.",
+        "difficulty": "medium",
+        "topic": "Photosynthesis",
+        "learning_objective": "State the products of photosynthesis.",
+        "common_mistakes": ["Answering carbon dioxide, which plants take in"],
+        "suggested_points": 1
+      },
+      {
+        "type": "THEORY",
+        "question_text": "Explain three ways a leaf is adapted for photosynthesis.",
+        "options": [],
+        "correct_answer": "",
+        "accepted_answers": [],
+        "marking_guide": "- Broad, flat surface to absorb more light (2 marks)\n- Thin, so gases diffuse a short distance (2 marks)\n- Stomata allow carbon dioxide in and oxygen out (2 marks)",
+        "explanation": "A leaf is broad to trap light, thin for fast diffusion and has stomata for gas exchange.",
+        "difficulty": "hard",
+        "topic": "Photosynthesis",
+        "learning_objective": "Explain how leaf structure supports photosynthesis.",
+        "common_mistakes": ["Listing features without explaining how they help"],
+        "suggested_points": 6
+      }
+    ]
+  }
+}
+```
+
+**Guarantees for every returned question:**
+- `MCQ`: exactly 4 distinct, non-empty options; `correct_answer` is exactly one of them; no "all/none of the above" options; `accepted_answers` is `[]`.
+- `FILL_BLANK`: `question_text` contains exactly one blank written as `____` (four underscores); `correct_answer` is the primary answer and `accepted_answers` lists it first plus up to 4 alternatives; `options` is `[]`.
+- `THEORY`: `correct_answer` is `""`, `options` and `accepted_answers` are `[]`; `marking_guide` lists at least two creditable points, one per line, with their marks.
+- `suggested_points` is 1-2 for MCQ and FILL_BLANK and 5-10 for THEORY; `difficulty` is `easy`, `medium` or `hard`; `topic` is one of the requested topics; `common_mistakes` has at most 4 items.
+- Questions that fail these checks, or that duplicate `avoid_questions` or another generated question, are dropped, never repaired. Questions are still AI-written: a teacher should review them before publishing.
+
+**How it works:** questions are requested from the model in batches of at most 5, with question types,
+topics and difficulty spread evenly across the request. Shortfalls are retried up to two more rounds.
+If fewer than `count` questions pass the checks, the response is still 200, with `generated < requested`
+and an explanation in `warnings`. Questions are returned grouped by type (MCQ, then FILL_BLANK, then THEORY).
+
+**Latency:** each batch is one model call. With Ollama on a GPU expect roughly 10-30 seconds per batch of
+5; on a CPU it can be 1-3 minutes per batch. Set client timeouts accordingly (at least 10 minutes for 30
+questions). No new model call starts after `GENERATION_TIME_BUDGET_SECONDS` (default 360); questions made
+by then are returned with a warning.
+
+**Usage:** the request counts as one unit per generated question (at least one) for usage analytics and
+the monthly quota.
+
+**Errors:**
+| Status | Code | When |
+|---|---|---|
+| 400 | `VAL_001` / `VAL_002` | invalid body; `details.validation_errors` lists the fields |
+| 401 | `AUTH_001` / `AUTH_002` | missing or invalid credentials |
+| 422 | `GEN_002` | the provider answered but no valid questions could be produced; `details.reasons` lists why questions were rejected |
+| 429 | `RATE_001` / `RATE_002` | rate limit or monthly quota exceeded |
+| 503 | `GEN_001` | "Question generation is unavailable right now": no capable provider could be reached (see `Retry-After`) |
+
+**Configuration (environment variables):**
+| Variable | Default | Meaning |
+|---|---|---|
+| `OLLAMA_MODEL` | `llama3.2:latest` | model used for grading and generation |
+| `OLLAMA_GENERATION_TIMEOUT` | `180` | seconds to wait for one generation call |
+| `OLLAMA_GENERATION_NUM_CTX` | `8192` | context window requested from Ollama for generation |
+| `GENERATION_TIME_BUDGET_SECONDS` | `360` | no new model call starts after this long |
+| `GUNICORN_TIMEOUT` (Docker) | `600` | worker timeout; must exceed the generation budget plus one call |
+
 ## Error Responses
 
 ### Authentication Error (401)

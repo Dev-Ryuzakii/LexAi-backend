@@ -283,7 +283,7 @@ def test_upload_and_export(client, alice):
 
 def test_changelog_is_public(client):
     body = client.get('/api/v1/changelog').get_json()
-    assert body['latest_version'] == '1.2.0' and body['total_versions'] == 3
+    assert body['latest_version'] == '1.3.0' and body['total_versions'] == 4
     assert client.get('/api/v1/changelog?version=1.1.0').get_json()['changelog'][0]['version'] == '1.1.0'
     assert client.get('/api/v1/changelog/breaking-changes').get_json()['breaking_changes']
     assert client.get('/api/v1/changelog/deprecations').get_json()['deprecations']

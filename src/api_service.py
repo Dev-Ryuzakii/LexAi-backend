@@ -30,7 +30,7 @@ from database import (
 )
 from scoring import MAX_SCORE
 
-API_VERSION = '1.2.0'
+API_VERSION = '1.3.0'
 
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
@@ -649,6 +649,50 @@ SCORE_RULES = {
     'metadata': {'type': dict},
 }
 
+GENERATE_RULES = {
+    'subject': {'type': str, 'required': True, 'max_length': 200},
+    'topics': {'type': list, 'required': True, 'max_items': 10},
+    'level': {'type': str, 'max_length': 100},
+    'count': {'type': int, 'required': True, 'min': 1, 'max': 30},
+    'question_types': {'type': list, 'required': True, 'max_items': 3},
+    'difficulty': {'type': str, 'choices': ['easy', 'medium', 'hard', 'mixed']},
+    'instructions': {'type': str, 'max_length': 2000},
+    'source_material': {'type': str, 'max_length': 20000},
+    'avoid_questions': {'type': list, 'max_items': 100},
+}
+
+
+def generation_spec(body: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Check the list items validate_body cannot, and build the generation spec."""
+    from generation import QUESTION_TYPES
+    errors: List[Dict[str, Any]] = []
+
+    def strings(field: str, max_length: int) -> List[str]:
+        out = []
+        for i, item in enumerate(body.get(field) or []):
+            if not isinstance(item, str) or not item.strip():
+                errors.append({'field': f'{field}[{i}]', 'message': 'Must be a non-empty string', 'type': 'type_error', 'input': item})
+            elif len(item.strip()) > max_length:
+                errors.append({'field': f'{field}[{i}]', 'message': f'Must be at most {max_length} characters', 'type': 'value_error', 'input': None})
+            elif item.strip() not in out:
+                out.append(item.strip())
+        return out
+
+    topics = strings('topics', 200)
+    avoid = strings('avoid_questions', 1000)
+    types = strings('question_types', 20)
+    for qtype in types:
+        if qtype not in QUESTION_TYPES:
+            errors.append({'field': 'question_types', 'message': f"Must contain only: {', '.join(QUESTION_TYPES)}",
+                           'type': 'value_error', 'input': qtype})
+    spec = {
+        'subject': body['subject'], 'topics': topics, 'level': body.get('level') or '', 'count': body['count'],
+        'question_types': types, 'difficulty': body.get('difficulty') or 'mixed',
+        'instructions': body.get('instructions') or '', 'source_material': body.get('source_material') or '',
+        'avoid_questions': avoid,
+    }
+    return spec, errors
+
 
 def register_api_routes(app):
 
@@ -714,6 +758,7 @@ def register_api_routes(app):
                 'students': '/api/v1/students',
                 'responses': '/api/v1/responses',
                 'scoring': '/api/v1/score',
+                'generate_questions': '/api/v1/generate-questions',
                 'submit_response': '/api/v1/submit-response',
                 'api_keys': '/api/v1/api-keys',
             },
@@ -764,6 +809,49 @@ def register_api_routes(app):
             'metadata': body.get('metadata'),
         })
         return jsonify(payload)
+
+    # --- Question generation ---------------------------------------------------------------
+
+    @app.route('/api/v1/generate-questions', methods=['POST'])
+    @require_auth
+    @idempotent
+    @validate_body(GENERATE_RULES)
+    def api_generate_questions():
+        """Generate exam questions (MCQ, fill-in-the-blank, theory) with answer keys and marking guides."""
+        from generation import GenerationFailed, GenerationUnavailable
+        spec, errors = generation_spec(g.body)
+        if errors:
+            return validation_error(errors)
+
+        started = time.time()
+        try:
+            result = ai_service_manager.generate_questions(spec)
+        except GenerationUnavailable as e:
+            logger.warning(f"Request {g.request_id}: question generation unavailable: {e}")
+            return api_error(503, 'GEN_001', 'Question generation is unavailable right now', reason=str(e))
+        except GenerationFailed as e:
+            return api_error(422, 'GEN_002', 'No valid questions could be generated. Try rephrasing the topics or '
+                             'instructions, or try again.', reasons=e.reasons)
+
+        generated = len(result['questions'])
+        g.usage_units = max(generated, 1)
+        # The request itself already used one unit. The questions exist now, so an exhausted
+        # quota is not reported here; the next request is refused instead.
+        consume_quota(generated - 1)
+        return jsonify({
+            'success': True,
+            'request_id': g.request_id,
+            'timestamp': now_iso(),
+            'processing_time': round(time.time() - started, 3),
+            'model_used': result.get('model_used') or 'unknown',
+            'provider': result.get('provider') or 'unknown',
+            'data': {
+                'requested': result['requested'],
+                'generated': generated,
+                'warnings': result['warnings'],
+                'questions': result['questions'],
+            },
+        })
 
     # --- Questions --------------------------------------------------------------------------
 
