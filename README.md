@@ -27,6 +27,7 @@ python src/app_api.py               # http://127.0.0.1:5001/api/v1/
 Or run `./start.sh` (or `start_platform.bat` on Windows), which does the same.
 
 With Docker, `docker compose up --build` runs migrations and serves with gunicorn on port 5001.
+The API port binds to the host's loopback interface for a local reverse proxy.
 Set `CENCORI_API_KEY` in `.env` before starting the container.
 
 ### VPS with an existing PostgreSQL container
