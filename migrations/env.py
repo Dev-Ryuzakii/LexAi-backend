@@ -28,7 +28,9 @@ target_metadata = Base.metadata
 
 # DATABASE_URL wins over alembic.ini so the app and migrations always use the same database.
 if os.environ.get('DATABASE_URL'):
-    config.set_main_option('sqlalchemy.url', os.environ['DATABASE_URL'])
+    # ConfigParser treats % as interpolation syntax. PostgreSQL passwords may
+    # contain percent-encoded characters, so escape them for Alembic's config.
+    config.set_main_option('sqlalchemy.url', os.environ['DATABASE_URL'].replace('%', '%%'))
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

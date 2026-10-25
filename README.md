@@ -29,6 +29,29 @@ Or run `./start.sh` (or `start_platform.bat` on Windows), which does the same.
 With Docker, `docker compose up --build` runs migrations and serves with gunicorn on port 5001.
 Set `CENCORI_API_KEY` in `.env` before starting the container.
 
+### VPS with an existing PostgreSQL container
+
+LexAI can use a dedicated database inside an existing PostgreSQL container. Do not
+install another PostgreSQL server or reuse another project's database or login.
+On the current VPS, `shared-postgres` is attached to the `afribase-shared` Docker
+network. After pulling this repo on the VPS, run:
+
+```bash
+POSTGRES_DOCKER_NETWORK=afribase-shared bash scripts/setup_existing_postgres.sh
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml ps
+curl --fail http://127.0.0.1:5001/api/v1/health
+```
+
+The setup script creates the `lexai` database and `lexai_app` login in
+`shared-postgres`, generates a random password, and saves its connection URL and
+network name in the ignored `.env` file. It stops without changing credentials if
+either the database or login already exists. Keep `.env` private; `.env.production`
+is not read by this Compose configuration. The API container runs Alembic migrations
+before accepting requests. No host `psql` installation is needed because the script
+uses the client inside the PostgreSQL container. If your container or network has a
+different name, set `POSTGRES_CONTAINER` and `POSTGRES_DOCKER_NETWORK` accordingly.
+
 All settings are environment variables. `.env.example` lists every variable and its default.
 
 To connect an existing CBT project, follow the [integration guide](API_INTEGRATION_GUIDE.md).

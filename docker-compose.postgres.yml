@@ -1,0 +1,12 @@
+# Add this override when PostgreSQL already runs in a different Compose project:
+# docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+services:
+  lexai-api:
+    networks:
+      - default
+      - postgres_external
+
+networks:
+  postgres_external:
+    external: true
+    name: ${POSTGRES_DOCKER_NETWORK:?Set POSTGRES_DOCKER_NETWORK to the existing PostgreSQL Docker network}
