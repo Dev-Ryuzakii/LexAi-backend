@@ -54,6 +54,9 @@ uses the client inside the PostgreSQL container. If your container or network ha
 different name, set `POSTGRES_CONTAINER` and `POSTGRES_DOCKER_NETWORK` accordingly.
 
 All settings are environment variables. `.env.example` lists every variable and its default.
+For the hosted frontend, set `CORS_ORIGINS=http://localhost:3000,https://lexai.altrisco.tech`
+in the VPS `.env` and recreate `lexai-api`. The origin must match the browser's
+scheme and hostname exactly and must not end in a slash.
 
 To connect an existing CBT project, follow the [integration guide](API_INTEGRATION_GUIDE.md).
 It covers server-side API keys, grading with your own records, storing assessments
