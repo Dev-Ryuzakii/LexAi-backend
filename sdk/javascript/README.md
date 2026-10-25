@@ -12,12 +12,14 @@ import { LexAIClient } from '@lexical-ai/lexai-cbt-sdk';
 
 const client = new LexAIClient({
   apiKey: process.env.LEXAI_API_KEY,
+  defaultMaxScore: 20, // default for this course, exam, or test
 });
 
 const result = await client.scoreAnswer({
   studentAnswer: 'Paris',
   markingGuide: 'Paris is the capital of France.',
   questionText: 'What is the capital of France?',
+  maxScore: 10, // optional override for this question
 });
 console.log(result.model_used, result.data.score, result.needs_review);
 ```
@@ -27,13 +29,20 @@ console.log(result.model_used, result.data.score, result.needs_review);
 The default base URL is `https://apilexaia.altrisco.tech/api/v1`. Pass
 `baseUrl` to the constructor to use a local or other LexAI deployment.
 
+Set `defaultMaxScore` on a client used for one course, exam, or test. It applies
+to `scoreAnswer` and `createQuestion`. Pass `maxScore` on either call to override
+it for one question. Stored questions keep their maximum, which `submitResponse`
+uses when grading. Updating a question's maximum affects future submissions;
+previously stored response grades keep their original maximum. Scores can be
+0.01–1000 points, with up to two decimal places. The default is 5.
+
 ## Methods
 
 | Method | Purpose |
 |---|---|
-| `scoreAnswer({ studentAnswer, markingGuide, questionText? })` | Grade without storing a LexAI response |
+| `scoreAnswer({ studentAnswer, markingGuide, questionText?, maxScore? })` | Grade without storing a LexAI response |
 | `generateQuestions({ subject, topics, count, questionTypes, ... })` | Generate draft MCQ, fill-blank, or theory questions |
-| `createQuestion({ questionText, markingGuide })` | Save a question and return `question_id` |
+| `createQuestion({ questionText, markingGuide, maxScore? })` | Save a question and return `question_id` |
 | `createStudent({ name, matricNumber })` | Save or find a student and return `student_id` |
 | `submitResponse({ studentId, questionId, answer })` | Grade and store one response |
 | `getResponse(responseId)` | Read a stored response |

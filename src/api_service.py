@@ -5,6 +5,7 @@ Every assessment record (question, student, response) belongs to the user who
 created it, and every query is scoped to the authenticated user.
 """
 import logging
+import math
 import os
 import re
 import secrets
@@ -26,7 +27,7 @@ from database import (
     effective_score, hash_password, hash_secret, password_needs_rehash, recalculate_student_score,
     verify_password,
 )
-from scoring import MAX_SCORE
+from scoring import MAX_SCORE, MAX_ALLOWED_SCORE
 from question_generation import DIFFICULTIES, QUESTION_TYPES, GenerationError, generate_questions
 
 API_VERSION = '1.2.0'
@@ -184,6 +185,9 @@ def validate_body(rules: Dict[str, Dict[str, Any]], allow_empty: bool = False):
                         fail(field, 'Must be a whole number', 'type_error', value)
                         continue
                     value = kind(value)
+                    if not math.isfinite(value):
+                        fail(field, 'Must be a finite number', 'value_error', str(value))
+                        continue
                     if 'min' in rule and value < rule['min']:
                         fail(field, f"Must be at least {rule['min']}", 'value_error', value)
                         continue
@@ -349,7 +353,8 @@ def _iso(value) -> Optional[str]:
 
 
 def question_json(q: Question) -> Dict[str, Any]:
-    return {'id': q.id, 'question_text': q.question_text, 'marking_guide': q.marking_guide, 'created_at': _iso(q.created_at)}
+    return {'id': q.id, 'question_text': q.question_text, 'marking_guide': q.marking_guide,
+            'max_score': q.max_score, 'created_at': _iso(q.created_at)}
 
 
 def student_json(s: Student) -> Dict[str, Any]:
@@ -409,11 +414,11 @@ def new_api_key(db, user_id: int, key_name: str, plan_type: str, rate_limit: int
 
 # --- Scoring -----------------------------------------------------------------------------
 
-def score_answer(student_answer: str, marking_guide: str, question_text: str = "") -> Dict[str, Any]:
+def score_answer(student_answer: str, marking_guide: str, question_text: str = "", max_score: float = MAX_SCORE) -> Dict[str, Any]:
     """Grade an answer. success=False means no grade was produced; it never means a zero."""
     start = time.time()
     try:
-        result = ai_service_manager.score_answer(student_answer, marking_guide, question_text)
+        result = ai_service_manager.score_answer(student_answer, marking_guide, question_text, max_score)
     except Exception:
         logger.exception("Scoring raised unexpectedly")
         result = {'scoring_method': 'unavailable', 'error': 'Unexpected scoring error'}
@@ -436,7 +441,7 @@ def score_answer(student_answer: str, marking_guide: str, question_text: str = "
         'needs_review': bool(result.get('needs_review', False)),
         'data': {
             'score': result['score'],
-            'max_score': result.get('max_score', MAX_SCORE),
+            'max_score': max_score,
             'confidence': result.get('confidence', 0.0),
             'feedback': result.get('feedback', ''),
             'strengths': result.get('strengths', []),
@@ -547,10 +552,14 @@ def register_api_routes(app):
         'question_text': {'type': str, 'max_length': TEXT_LIMITS['question_text']},
         'student_name': {'type': str, 'max_length': 100},
         'matric_number': {'type': str, 'max_length': 50},
+        'max_score': {'type': float, 'min': 0.01, 'max': MAX_ALLOWED_SCORE},
     })
     def api_score_answer():
         body = g.body
-        result = score_answer(body['student_answer'], body['marking_guide'], body.get('question_text', ''))
+        max_score = body.get('max_score', MAX_SCORE)
+        if round(max_score, 2) != max_score:
+            return api_error(400, 'VAL_001', 'max_score supports at most two decimal places')
+        result = score_answer(body['student_answer'], body['marking_guide'], body.get('question_text', ''), max_score)
         if not result['success']:
             return api_error(503, 'SCORE_001', 'The answer could not be graded right now. Retry later.',
                              reason=result['message'])
@@ -644,8 +653,11 @@ def register_api_routes(app):
     @validate_body({
         'question_text': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['question_text']},
         'marking_guide': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['marking_guide']},
+        'max_score': {'type': float, 'min': 0.01, 'max': MAX_ALLOWED_SCORE},
     })
     def api_create_question():
+        if 'max_score' in g.body and round(g.body['max_score'], 2) != g.body['max_score']:
+            return api_error(400, 'VAL_001', 'max_score supports at most two decimal places')
         db = get_db()
         question = Question(owner_id=current_user_id(), **g.body)
         db.add(question)
@@ -666,8 +678,11 @@ def register_api_routes(app):
     @validate_body({
         'question_text': {'type': str, 'max_length': TEXT_LIMITS['question_text']},
         'marking_guide': {'type': str, 'max_length': TEXT_LIMITS['marking_guide']},
+        'max_score': {'type': float, 'min': 0.01, 'max': MAX_ALLOWED_SCORE},
     })
     def api_update_question(question_id):
+        if 'max_score' in g.body and round(g.body['max_score'], 2) != g.body['max_score']:
+            return api_error(400, 'VAL_001', 'max_score supports at most two decimal places')
         db = get_db()
         question = owned_question(db, question_id)
         if not question:
@@ -904,7 +919,7 @@ def register_api_routes(app):
             return api_error(409, 'RES_003', 'This student already submitted an answer to this question',
                              response_id=existing.id)
 
-        result = score_answer(body['answer'], question.marking_guide, question.question_text)
+        result = score_answer(body['answer'], question.marking_guide, question.question_text, question.max_score)
         if not result['success']:
             # Nothing is stored, so the client can safely retry.
             return api_error(503, 'SCORE_001', 'The answer could not be graded right now. Nothing was saved; retry later.',

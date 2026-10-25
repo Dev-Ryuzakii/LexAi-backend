@@ -7,11 +7,19 @@ JSON object with an integer score inside the scale. Anything else raises, so
 """
 import json
 import logging
+import math
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 MAX_SCORE = 5
+MAX_ALLOWED_SCORE = 1000
+
+
+def validate_max_score(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= MAX_ALLOWED_SCORE or round(value, 2) != value:
+        raise ValueError('max_score must be a number greater than 0 and at most 1000, with up to two decimal places')
+    return float(value)
 
 
 class ScoringError(Exception):
@@ -54,9 +62,11 @@ def parse_scoring_response(text: str, max_score: int = MAX_SCORE) -> Dict[str, A
     # bool is a subclass of int; "true" is not a grade.
     if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
         raise ScoringParseError(f"Score is not a number: {raw_score!r}")
-    if raw_score != int(raw_score):
-        raise ScoringParseError(f"Score is not a whole number: {raw_score!r}")
-    score = int(raw_score)
+    if not math.isfinite(raw_score):
+        raise ScoringParseError(f"Score is not finite: {raw_score!r}")
+    if round(raw_score, 2) != raw_score:
+        raise ScoringParseError(f"Score has more than two decimal places: {raw_score!r}")
+    score = float(raw_score)
     if not 0 <= score <= max_score:
         raise ScoringParseError(f"Score {score} is outside 0-{max_score}")
 
@@ -90,15 +100,17 @@ class StrictScoringMixin:
     provider_name = "unknown"
     parse_attempts = 2
 
-    def score_answer(self, student_answer: str, marking_guide: str, question: str = "") -> Dict[str, Any]:
+    def score_answer(self, student_answer: str, marking_guide: str, question: str = "", max_score: float = MAX_SCORE) -> Dict[str, Any]:
         if not student_answer or not marking_guide:
             raise ScoringError("Missing student answer or marking guide")
+        validate_max_score(max_score)
 
-        cached = self.response_cache.get(student_answer, marking_guide, question)
+        cached = self.response_cache.get(student_answer, marking_guide, question, max_score)
         if cached:
             return {**cached, "cached": True}
 
-        prompt = self._create_scoring_prompt(student_answer, marking_guide, question)
+        from grading_helpers import create_scoring_prompt
+        prompt = create_scoring_prompt(student_answer, marking_guide, question, max_score)
         last_error: Exception = ScoringError("No attempts made")
         for attempt in range(1, self.parse_attempts + 1):
             try:
@@ -106,7 +118,7 @@ class StrictScoringMixin:
             except Exception as e:
                 raise ScoringError(f"{self.provider_name} request failed: {e}") from e
             try:
-                result = parse_scoring_response(text)
+                result = parse_scoring_response(text, max_score)
             except ScoringParseError as e:
                 last_error = e
                 logger.warning(f"{self.provider_name}: unusable output on attempt {attempt}/{self.parse_attempts}: {e}")
@@ -114,7 +126,7 @@ class StrictScoringMixin:
 
             result["model_used"] = self.model
             result["scoring_method"] = self.provider_name
-            self.response_cache.set(student_answer, marking_guide, question, result)
+            self.response_cache.set(student_answer, marking_guide, question, result, max_score)
             return {**result, "cached": False}
 
         raise last_error

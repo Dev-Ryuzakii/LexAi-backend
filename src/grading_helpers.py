@@ -14,13 +14,13 @@ class ResponseCache:
         self.max_size = max_size
         self.ttl = ttl  # Time to live in seconds
 
-    def _generate_key(self, student_answer, marking_guide, question):
-        combined = f"{student_answer.strip().lower()}|{marking_guide.strip().lower()}|{(question or '').strip().lower()}"
+    def _generate_key(self, student_answer, marking_guide, question, max_score=MAX_SCORE):
+        combined = f"{student_answer.strip().lower()}|{marking_guide.strip().lower()}|{(question or '').strip().lower()}|{max_score}"
         return hashlib.sha256(combined.encode()).hexdigest()
 
-    def get(self, student_answer, marking_guide, question):
+    def get(self, student_answer, marking_guide, question, max_score=MAX_SCORE):
         """Get a copy of the cached response if available and not expired"""
-        key = self._generate_key(student_answer, marking_guide, question)
+        key = self._generate_key(student_answer, marking_guide, question, max_score)
         if key in self.cache:
             timestamp, response = self.cache[key]
             if time.time() - timestamp <= self.ttl:
@@ -29,8 +29,8 @@ class ResponseCache:
             del self.cache[key]
         return None
 
-    def set(self, student_answer, marking_guide, question, response):
-        key = self._generate_key(student_answer, marking_guide, question)
+    def set(self, student_answer, marking_guide, question, response, max_score=MAX_SCORE):
+        key = self._generate_key(student_answer, marking_guide, question, max_score)
         self.cache[key] = (time.time(), dict(response))
 
         if len(self.cache) > self.max_size:
@@ -40,7 +40,7 @@ class ResponseCache:
                 del self.cache[k]
 
 
-def create_scoring_prompt(student_answer: str, marking_guide: str, question: str = "") -> str:
+def create_scoring_prompt(student_answer: str, marking_guide: str, question: str = "", max_score: float = MAX_SCORE) -> str:
     return f"""
 You are an expert educator tasked with scoring student answers based on MEANING and UNDERSTANDING, not exact word matching.
 
@@ -58,17 +58,17 @@ Your task:
 - Focus on whether the student demonstrates understanding of the concept
 - Award points based on how well the meaning aligns with the marking guide
 
-Scoring Scale (INTEGER ONLY):
-- 5: Excellent understanding, meaning perfectly aligns with marking guide
-- 4: Good understanding, meaning mostly aligns with minor gaps
-- 3: Adequate understanding, meaning somewhat aligns but missing some key points
-- 2: Basic understanding, meaning partially aligns but significant gaps
-- 1: Poor understanding, meaning barely aligns with marking guide
-- 0: No understanding, meaning does not align or is completely incorrect
+Scoring Scale (0 to {max_score} points):
+- Full credit: Excellent understanding, meaning perfectly aligns with marking guide
+- About 80%: Good understanding, meaning mostly aligns with minor gaps
+- About 60%: Adequate understanding, meaning somewhat aligns but missing some key points
+- About 40%: Basic understanding, meaning partially aligns but significant gaps
+- About 20%: Poor understanding, meaning barely aligns with marking guide
+- Zero: No understanding, meaning does not align or is completely incorrect
 
 Please provide your response in the following JSON format:
 {{
-    "score": 4,
+    "score": {round(max_score * 0.8, 2)},
     "confidence": 0.9,
     "feedback": "The student demonstrates good understanding of the concept. The meaning aligns well with the marking guide despite different wording.",
     "strengths": ["Correct core concept", "Good explanation"],
@@ -76,7 +76,7 @@ Please provide your response in the following JSON format:
 }}
 
 Important:
-- Score must be an INTEGER between 0-{MAX_SCORE}
+- Score must be a number between 0 and {max_score}, with at most two decimal places
 - Confidence must be a number between 0 and 1
 - Focus on MEANING and UNDERSTANDING, not exact words
 - Consider different ways of expressing the same concept as correct

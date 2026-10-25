@@ -96,7 +96,7 @@ class AIServiceManager:
             "error": reason,
         }
 
-    def score_answer(self, student_answer: str, marking_guide: str, question: str = "") -> Dict[str, Any]:
+    def score_answer(self, student_answer: str, marking_guide: str, question: str = "", max_score: float = MAX_SCORE) -> Dict[str, Any]:
         if not student_answer or not marking_guide:
             return self._unavailable("Missing student answer or marking guide")
 
@@ -114,7 +114,7 @@ class AIServiceManager:
                 if not service.check_connection():
                     errors.append(f"{service_name}: unavailable")
                     continue
-                result = service.score_answer(student_answer, marking_guide, question)
+                result = service.score_answer(student_answer, marking_guide, question, max_score)
             except ScoringError as e:
                 logger.error(f"{service_name} could not grade: {e}")
                 errors.append(f"{service_name}: {e}")
@@ -129,12 +129,12 @@ class AIServiceManager:
                 result['scoring_method'] = 'lexai'
             else:
                 result['scoring_method'] = service_name
-            result["max_score"] = MAX_SCORE
+            result["max_score"] = max_score
             result["needs_review"] = result.get("confidence", 0.0) < self.review_confidence_threshold
             return result
 
         if self.allow_similarity_fallback and fallback_similarity_score:
-            score = fallback_similarity_score(student_answer, marking_guide)
+            score = round(fallback_similarity_score(student_answer, marking_guide) / MAX_SCORE * max_score, 2)
             logger.warning("No AI provider could grade; using text-similarity estimate flagged for review")
             return {
                 "score": score,
@@ -144,7 +144,7 @@ class AIServiceManager:
                 "weaknesses": [],
                 "model_used": "basic_similarity",
                 "scoring_method": "basic_similarity",
-                "max_score": MAX_SCORE,
+                "max_score": max_score,
                 "needs_review": True,
                 "cached": False,
                 "provider_errors": errors,

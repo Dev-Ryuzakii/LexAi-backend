@@ -87,7 +87,7 @@ unique within one owner's records, not across all owners.
 - If no provider can grade, the response is `503 SCORE_001` and **nothing is stored**, so the client can safely retry.
 - A grade is stored as `needs_review` (and left out of the student's total) when the AI's confidence is below `REVIEW_CONFIDENCE_THRESHOLD` or when it came from the text-similarity fallback. A lecturer confirms or overrides it with `PUT /api/v1/responses/{id}` `{"score": n}`.
 - A student's `score` is always the sum of their graded responses. It is recalculated in the same transaction whenever a response is created, rescored or deleted, and it can't be set directly.
-- Model output becomes a grade only if it is valid JSON with a whole-number score from 0 to 5. Anything else is retried once and then treated as a failure.
+- Model output becomes a grade only if it is valid JSON with a score between 0 and the requested maximum, with up to two decimal places. Anything else is retried once and then treated as a failure. The maximum defaults to 5 and can be set per stateless scoring call or stored question (0.01–1000).
 
 ## Limits
 

@@ -1,6 +1,6 @@
 {
   "name": "@lexical-ai/lexai-cbt-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Server-side JavaScript and TypeScript client for LexAI 3.0 CBT grading and question generation",
   "repository": {
     "type": "git",

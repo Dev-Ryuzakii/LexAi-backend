@@ -38,6 +38,7 @@ class Question(Base):
     owner_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
     question_text = Column(Text, nullable=False)
     marking_guide = Column(Text, nullable=False)
+    max_score = Column(Float, nullable=False, default=5.0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

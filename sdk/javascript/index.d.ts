@@ -5,6 +5,8 @@ export interface ClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Default maximum points for scoreAnswer and createQuestion. Use one client per course, exam, or test to set its default. */
+  defaultMaxScore?: number;
 }
 
 export interface RequestOptions { signal?: AbortSignal }
@@ -98,9 +100,9 @@ export class LexAIError extends Error {
 
 export class LexAIClient {
   constructor(options: ClientOptions);
-  scoreAnswer(input: { studentAnswer: string; markingGuide: string; questionText?: string; studentName?: string; matricNumber?: string; metadata?: Record<string, unknown> }, options?: RequestOptions): Promise<ScoreResult>;
+  scoreAnswer(input: { studentAnswer: string; markingGuide: string; questionText?: string; studentName?: string; matricNumber?: string; metadata?: Record<string, unknown>; maxScore?: number }, options?: RequestOptions): Promise<ScoreResult>;
   generateQuestions(input: { subject: string; topics: string[]; count: number; questionTypes: Array<'MCQ' | 'FILL_BLANK' | 'THEORY'>; difficulty?: 'easy' | 'medium' | 'hard' | 'mixed'; level?: string; instructions?: string; sourceMaterial?: string; avoidQuestions?: string[] }, options?: RequestOptions): Promise<GenerationResult>;
-  createQuestion(input: { questionText: string; markingGuide: string }, options?: RequestOptions): Promise<{ success: true; question_id: number }>;
+  createQuestion(input: { questionText: string; markingGuide: string; maxScore?: number }, options?: RequestOptions): Promise<{ success: true; question_id: number }>;
   createStudent(input: { name: string; matricNumber: string }, options?: RequestOptions): Promise<{ success: true; student_id: number }>;
   submitResponse(input: { studentId: number; questionId: number; answer: string }, options?: RequestOptions): Promise<SubmitResult>;
   getResponse(responseId: number, options?: RequestOptions): Promise<{ response: ResponseRecord }>;

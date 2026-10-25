@@ -23,7 +23,7 @@ test('maps score request and reads LexAI grade', async () => {
   assert.equal(request.url, `${endpoint}/score`);
   assert.equal(request.options.headers['X-API-Key'], 'server-secret');
   assert.deepEqual(JSON.parse(request.options.body), {
-    student_answer: 'Paris', marking_guide: 'Paris', question_text: 'Capital?',
+    student_answer: 'Paris', marking_guide: 'Paris', question_text: 'Capital?', max_score: 5,
   });
 });
 
@@ -38,6 +38,7 @@ test('maps stored-assessment calls and filters', async () => {
   await client.submitResponse({ studentId: 2, questionId: 3, answer: 'Paris' });
   await client.listResponses({ studentId: 2, questionId: 3 });
   assert.equal(calls[0].url, `${endpoint}/questions`);
+  assert.equal(JSON.parse(calls[0].options.body).max_score, 5);
   assert.equal(calls[1].url, `${endpoint}/students`);
   assert.deepEqual(JSON.parse(calls[2].options.body), { student_id: 2, question_id: 3, answer: 'Paris' });
   assert.equal(calls[3].url, `${endpoint}/responses?student_id=2&question_id=3`);
@@ -77,4 +78,21 @@ test('surfaces API error code and request ID without retrying submission', async
 
 test('rejects missing key before any request', () => {
   assert.throws(() => new LexAIClient({ apiKey: '' }), /apiKey is required/);
+});
+
+test('client default and per-question score overrides', async () => {
+  const bodies = [];
+  const client = new LexAIClient({ apiKey: 'server-secret', defaultMaxScore: 20,
+    fetchImpl: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return fakeResponse({ success: true });
+    },
+  });
+  await client.scoreAnswer({ studentAnswer: 'a', markingGuide: 'b' });
+  await client.scoreAnswer({ studentAnswer: 'a', markingGuide: 'b', maxScore: 2.5 });
+  await client.createQuestion({ questionText: 'Q', markingGuide: 'A' });
+  await client.createQuestion({ questionText: 'Q2', markingGuide: 'A2', maxScore: 10 });
+  assert.deepEqual(bodies.map(body => body.max_score), [20, 2.5, 20, 10]);
+  assert.throws(() => new LexAIClient({ apiKey: 'key', defaultMaxScore: 0 }), /maxScore/);
+  assert.throws(() => client.createQuestion({ questionText: 'Q', markingGuide: 'A', maxScore: 1.234 }), /maxScore/);
 });

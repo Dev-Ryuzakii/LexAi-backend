@@ -15,9 +15,10 @@ export class LexAIClient {
   #baseUrl;
   #fetch;
   #timeoutMs;
+  #defaultMaxScore;
 
   constructor({ apiKey, baseUrl = 'https://apilexaia.altrisco.tech/api/v1', fetchImpl = globalThis.fetch,
-    timeoutMs = 150_000 } = {}) {
+    timeoutMs = 150_000, defaultMaxScore = 5 } = {}) {
     if (typeof apiKey !== 'string' || !apiKey.trim()) {
       throw new TypeError('apiKey is required');
     }
@@ -27,6 +28,7 @@ export class LexAIClient {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new TypeError('timeoutMs must be a positive number');
     }
+    this.#defaultMaxScore = LexAIClient.#validateMaxScore(defaultMaxScore);
     const url = new URL(baseUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
       throw new TypeError('baseUrl must be an HTTP(S) URL without credentials, query, or fragment');
@@ -38,6 +40,14 @@ export class LexAIClient {
     this.#baseUrl = url.href.replace(/\/$/, '');
     this.#fetch = fetchImpl;
     this.#timeoutMs = timeoutMs;
+  }
+
+  static #validateMaxScore(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0.01 || value > 1000 ||
+        Math.round(value * 100) / 100 !== value) {
+      throw new TypeError('maxScore must be between 0.01 and 1000, with at most two decimal places');
+    }
+    return value;
   }
 
   async #request(method, path, body, { signal } = {}) {
@@ -86,11 +96,12 @@ export class LexAIClient {
     }
   }
 
-  scoreAnswer({ studentAnswer, markingGuide, questionText = '', studentName, matricNumber, metadata }, options) {
+  scoreAnswer({ studentAnswer, markingGuide, questionText = '', studentName, matricNumber, metadata, maxScore }, options) {
     return this.#request('POST', '/score', {
       student_answer: studentAnswer,
       marking_guide: markingGuide,
       question_text: questionText,
+      max_score: LexAIClient.#validateMaxScore(maxScore ?? this.#defaultMaxScore),
       ...(studentName === undefined ? {} : { student_name: studentName }),
       ...(matricNumber === undefined ? {} : { matric_number: matricNumber }),
       ...(metadata === undefined ? {} : { metadata }),
@@ -112,10 +123,11 @@ export class LexAIClient {
     }, options);
   }
 
-  createQuestion({ questionText, markingGuide }, options) {
+  createQuestion({ questionText, markingGuide, maxScore }, options) {
     return this.#request('POST', '/questions', {
       question_text: questionText,
       marking_guide: markingGuide,
+      max_score: LexAIClient.#validateMaxScore(maxScore ?? this.#defaultMaxScore),
     }, options);
   }
 

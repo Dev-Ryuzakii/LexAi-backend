@@ -1,6 +1,6 @@
 # Integrate LexAI 3.0 into a CBT application
 
-LexAI grades theory answers on a **0–5** scale. Your CBT backend calls the LexAI API;
+LexAI grades theory answers against a chosen maximum (5 by default). Your CBT backend calls the LexAI API;
 your browser or mobile app calls your CBT backend. Keep both the Cencori project key
 and the LexAI integration key on servers only.
 
@@ -43,11 +43,12 @@ needed.
 {
   "student_answer": "Plants use sunlight to make glucose.",
   "marking_guide": "Photosynthesis converts light energy, water and carbon dioxide into glucose and oxygen.",
-  "question_text": "Explain photosynthesis."
+  "question_text": "Explain photosynthesis.",
+  "max_score": 20
 }
 ```
 
-A successful response includes `data.score`, `data.max_score` (5),
+A successful response includes `data.score`, `data.max_score`,
 `data.feedback`, `needs_review`, and `model_used: "LexAI 3.0"`. Store a score in
 final totals only when `needs_review` is false. If the API returns `503 SCORE_001`,
 no grade was produced; leave the answer pending and retry or send it for manual
@@ -55,7 +56,8 @@ review. Never turn a failed request into a zero.
 
 ### B. LexAI should also store the assessment records
 
-1. `POST /api/v1/questions` with `question_text` and `marking_guide`; save the
+1. `POST /api/v1/questions` with `question_text`, `marking_guide`, and optional
+   `max_score`; save the
    returned `question_id` beside your CBT question ID.
 2. `POST /api/v1/students` with `name` and `matric_number`; save the returned
    `student_id` beside your CBT student ID. Repeating the same matric number for
@@ -87,6 +89,7 @@ import { LexAIClient, LexAIError } from '@lexical-ai/lexai-cbt-sdk';
 const lexai = new LexAIClient({
   apiKey: process.env.LEXAI_API_KEY,
   baseUrl: process.env.LEXAI_BASE_URL ?? 'https://apilexaia.altrisco.tech/api/v1',
+  defaultMaxScore: 20, // default for this course, exam, or test
 });
 
 // In your authenticated CBT backend handler, fetch question and marking guide
@@ -95,12 +98,13 @@ const result = await lexai.scoreAnswer({
   studentAnswer: answerFromStudent,
   markingGuide: questionFromDatabase.markingGuide,
   questionText: questionFromDatabase.text,
+  maxScore: questionFromDatabase.points, // overrides the default for this question
 });
 
 if (result.needs_review) {
   // Keep pending for a lecturer; do not add to the final score yet.
 } else {
-  // Persist result.data.score (out of 5) and result.data.feedback.
+  // Persist result.data.score (out of result.data.max_score) and feedback.
 }
 ```
 
@@ -150,8 +154,10 @@ string keys are not supported.
 
 ## Grades and errors
 
-- `score` is a whole number from 0 to 5. Scale it to your CBT question's points
-  only after deciding how your assessment should round fractional points.
+- `max_score` may be 0.01–1000 with up to two decimal places. The AI grades
+  directly against that maximum; `score` may also have two decimal places.
+  SDK `defaultMaxScore` applies to `scoreAnswer` and `createQuestion`, and their
+  `maxScore` argument overrides it for one question.
 - `needs_review: true` means the grade is provisional. Stored responses with
   `grading_status: "needs_review"` are excluded from the LexAI student total.
 - `401 AUTH_001` or `AUTH_002`: missing, invalid, or revoked integration key.

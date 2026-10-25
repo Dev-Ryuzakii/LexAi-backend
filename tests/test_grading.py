@@ -34,7 +34,7 @@ def test_provider_error_text_is_not_a_grade():
 
 
 @pytest.mark.parametrize('reply', [
-    '{"score": 7}', '{"score": -1}', '{"score": 4.5}', '{"score": "4"}', '{"score": true}',
+    '{"score": 7}', '{"score": -1}', '{"score": 4.555}', '{"score": "4"}', '{"score": true}',
     '{"feedback": "great"}', '{"score": 4', '', 'The score is 3',
 ])
 def test_invalid_replies_raise(reply):
@@ -47,6 +47,20 @@ def test_valid_reply_parses():
     assert result['score'] == 4
     assert result['confidence'] == 0.85
     assert result['strengths'] == ['clear']
+    assert parse_scoring_response('{"score": 7.25}', 10)['score'] == 7.25
+
+
+def test_prompt_and_cache_use_requested_score(monkeypatch):
+    service = OllamaService()
+    prompts = []
+    def generate(prompt):
+        prompts.append(prompt)
+        return '{"score": 4}' if '0 to 5 points' in prompt else '{"score": 8.5}'
+    monkeypatch.setattr(service, '_generate', generate)
+    assert service.score_answer('answer', 'guide', max_score=5)['score'] == 4
+    assert service.score_answer('answer', 'guide', max_score=10)['score'] == 8.5
+    assert service.score_answer('answer', 'guide', max_score=10)['cached'] is True
+    assert len(prompts) == 2
 
 
 def test_provider_retries_bad_output_then_gives_up(monkeypatch):
@@ -131,6 +145,28 @@ def test_score_endpoint_reports_unavailable_as_error(client, alice, grader):
     grader.result = grader.unavailable()
     res = client.post('/api/v1/score', headers=alice, json={'student_answer': 'a', 'marking_guide': 'b'})
     assert res.status_code == 503
+
+
+def test_question_max_score_and_stateless_override(client, alice, grader):
+    grader.result = grader.grade(17)
+    question = client.post('/api/v1/questions', headers=alice,
+                           json={'question_text': 'Explain X', 'marking_guide': 'X is Y', 'max_score': 20}).get_json()['question']
+    assert question['max_score'] == 20
+    sid = client.post('/api/v1/students', headers=alice,
+                      json={'name': 'Ada', 'matric_number': 'M002'}).get_json()['student_id']
+    res = submit(client, alice, sid, question['id']).get_json()
+    assert res['scoring']['score'] == 17
+    assert res['scoring']['max_score'] == 20
+    assert grader.calls == 1
+    assert student_score(client, alice, sid) == 17
+    grader.result = grader.grade(2.5)
+    stateless = client.post('/api/v1/score', headers=alice,
+                            json={'student_answer': 'a', 'marking_guide': 'b', 'max_score': 2.5}).get_json()
+    assert stateless['data']['max_score'] == 2.5
+    assert stateless['data']['score'] == 2.5
+    for invalid in (0, -1, 1001, 1.234, '20', True):
+        assert client.post('/api/v1/score', headers=alice,
+                           json={'student_answer': 'a', 'marking_guide': 'b', 'max_score': invalid}).status_code == 400
 
 
 def test_review_grades_do_not_count_until_a_lecturer_confirms(client, alice, grader):
