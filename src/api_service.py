@@ -30,7 +30,7 @@ from database import (
 from scoring import MAX_SCORE, MAX_ALLOWED_SCORE
 from question_generation import DIFFICULTIES, QUESTION_TYPES, GenerationError, generate_questions
 
-API_VERSION = '1.2.0'
+API_VERSION = '1.3.0'
 
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
