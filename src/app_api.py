@@ -35,7 +35,7 @@ def create_app() -> Flask:
         # Behind one reverse proxy: take the client IP from X-Forwarded-For for IP rate limits.
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
-    origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', 'http://localhost:3000,https://lexai.altrisco.tech').split(',') if o.strip()]
+    origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', '*').split(',') if o.strip()]
     CORS(app, resources={r'/api/*': {'origins': origins}},
          expose_headers=['X-RateLimit-Limit', 'X-RateLimit-Used', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'X-Request-ID'])
 
