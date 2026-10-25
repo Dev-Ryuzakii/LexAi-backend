@@ -1,229 +1,162 @@
-# AI-CBT API Integration Guide
+# Integrate LexAI 3.0 into a CBT application
 
-This guide explains how to integrate the AI-CBT API into your applications.
+LexAI grades theory answers on a **0–5** scale. Your CBT backend calls the LexAI API;
+your browser or mobile app calls your CBT backend. Keep both the Cencori project key
+and the LexAI integration key on servers only.
 
-## Authentication
-
-The AI-CBT API supports two authentication methods:
-
-1. **API Keys** (Recommended for production use)
-2. **JWT-like Tokens** (For user authentication)
-
-### API Key Authentication
-
-API keys are the primary method for authenticating API requests. They are long-lived and can be generated through the user authentication flow or using the command-line tool.
-
-To use an API key, include it in the `X-API-Key` header of your requests:
-
-```http
-X-API-Key: lexai_your_api_key_here
+```text
+CBT browser/mobile app -> your CBT backend -> LexAI API -> Cencori
 ```
 
-### Token Authentication
+## 1. Start LexAI and create an integration key
 
-For user authentication, you can obtain a temporary JWT-like token through the login endpoint.
+1. Configure `CENCORI_API_KEY` in the LexAI backend's ignored `.env` and start the
+   backend. This is the **provider key**, used only by LexAI to call Cencori.
+2. Register or log in as a LexAI account owner. The login endpoint returns a
+   session token. Use that token to create an API key in the LexAI frontend or via
+   `POST /api/v1/api-keys` with `{"key_name":"CBT server","plan_type":"production"}`.
+   The response shows the key once. The key starts with `lexai_`.
+3. Save that **LexAI API key** as `LEXAI_API_KEY` in your CBT backend's environment.
+   It is different from `CENCORI_API_KEY`. Do not place it in frontend code or a
+   public environment variable.
 
-To use a token, include it in the `Authorization` header with the `Bearer` prefix:
-
-```http
-Authorization: Bearer auth_your_token_here
-```
-
-## Getting Started
-
-### 1. Obtain an API Key
-
-You can obtain an API key in two ways:
-
-#### Option A: Through User Authentication (Recommended)
-
-1. Register a new user account
-2. Login to obtain an authentication token
-3. Create an API key using the authentication token
-
-See the [API Usage Examples](file:///Users/macbook/Ai-CBT-Theory/examples/README.md) for detailed code examples.
-
-#### Option B: Using the Command-Line Tool
+You can also create an integration key for an existing account with:
 
 ```bash
-# Generate test API keys
-python src/generate_api_keys.py --test
-
-# Generate production API keys
-python src/generate_api_keys.py --prod
+python src/generate_api_keys.py create --email you@example.com --name "CBT server" --plan production
 ```
 
-### 2. Make API Requests
+The default production key limit is 1,000 requests per hour and 10,000 per month.
+Use a separate key for each CBT environment. All records created through a key
+belong to its LexAI account owner.
 
-Once you have an API key, you can make requests to the API endpoints.
+## 2. Choose the grading flow
 
-## API Endpoints
+### A. Your CBT project already stores questions and students
 
-All API endpoints are available under the `/api/v1/` prefix.
-
-### Core Endpoints
-
-- `POST /api/v1/score` - Score a student answer
-- `GET /api/v1/questions` - Get all questions
-- `POST /api/v1/questions` - Create a new question
-- `GET /api/v1/questions/{id}` - Get a specific question
-- `PUT /api/v1/questions/{id}` - Update a specific question
-- `DELETE /api/v1/questions/{id}` - Delete a specific question
-- `GET /api/v1/students` - Get all students
-- `POST /api/v1/students` - Create or get a student
-- `GET /api/v1/students/{id}` - Get a specific student
-- `PUT /api/v1/students/{id}` - Update a specific student
-- `DELETE /api/v1/students/{id}` - Delete a specific student
-- `GET /api/v1/responses` - Get all responses
-- `POST /api/v1/responses` - Create a new response
-- `GET /api/v1/responses/{id}` - Get a specific response
-- `PUT /api/v1/responses/{id}` - Update a specific response
-- `DELETE /api/v1/responses/{id}` - Delete a specific response
-- `POST /api/v1/submit-response` - Submit and score a student response
-- `GET /api/v1/student/{id}/responses` - Get all responses for a specific student
-
-### Authentication Endpoints
-
-- `POST /api/v1/register` - Register a new user
-- `POST /api/v1/login` - Login to obtain an authentication token
-- `POST /api/v1/logout` - Logout (invalidate authentication token)
-- `GET /api/v1/api-keys` - List API keys for the authenticated user
-- `POST /api/v1/api-keys` - Create a new API key
-- `DELETE /api/v1/api-keys/{id}` - Revoke an API key
-
-## Example Requests
-
-### Score a Student Answer
-
-```python
-import requests
-
-api_key = "lexai_your_api_key_here"
-url = "http://localhost:5001/api/v1/score"
-
-payload = {
-    "student_answer": "Photosynthesis is the process by which plants convert sunlight into energy.",
-    "marking_guide": "Photosynthesis is the process used by plants and other organisms to convert light energy into chemical energy that can later be released to fuel the organisms' activities.",
-    "question_text": "What is photosynthesis?"
-}
-
-headers = {
-    "X-API-Key": api_key,
-    "Content-Type": "application/json"
-}
-
-response = requests.post(url, json=payload, headers=headers)
-result = response.json()
-print(result)
-```
-
-### Create a Question
-
-```python
-import requests
-
-api_key = "lexai_your_api_key_here"
-url = "http://localhost:5001/api/v1/questions"
-
-payload = {
-    "question_text": "What is the capital of France?",
-    "marking_guide": "The capital of France is Paris."
-}
-
-headers = {
-    "X-API-Key": api_key,
-    "Content-Type": "application/json"
-}
-
-response = requests.post(url, json=payload, headers=headers)
-result = response.json()
-print(result)
-```
-
-### JavaScript Example
-
-```javascript
-const API_KEY = "lexai_your_api_key_here";
-const BASE_URL = "http://localhost:5001/api/v1";
-
-async function scoreAnswer(studentAnswer, markingGuide, questionText = "") {
-    const url = `${BASE_URL}/score`;
-    const payload = {
-        student_answer: studentAnswer,
-        marking_guide: markingGuide,
-        question_text: questionText
-    };
-
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': API_KEY
-            },
-            body: JSON.stringify(payload)
-        });
-        return await response.json();
-    } catch (error) {
-        console.error('Error:', error);
-        throw error;
-    }
-}
-
-// Usage
-scoreAnswer(
-    "Photosynthesis is the process by which plants convert sunlight into energy.",
-    "Photosynthesis is the process used by plants and other organisms to convert light energy into chemical energy that can later be released to fuel the organisms' activities.",
-    "What is photosynthesis?"
-).then(result => {
-    console.log(result);
-});
-```
-
-## Rate Limiting
-
-The API implements rate limiting to ensure fair usage:
-
-- **Development/Testing Keys**: 1,000 requests per hour
-- **Production Keys**: Configurable based on your plan (default 10,000 requests per hour)
-
-If you exceed your rate limit, you'll receive a 429 (Too Many Requests) response.
-
-## Error Handling
-
-The API returns standard HTTP status codes:
-
-- `200` - Success
-- `201` - Created
-- `400` - Bad Request (validation errors)
-- `401` - Unauthorized (missing or invalid authentication)
-- `404` - Not Found
-- `429` - Too Many Requests (rate limiting)
-- `500` - Internal Server Error
-
-Error responses include a JSON body with details:
+Use `POST /api/v1/score`. Pass the student answer, the marking guide from your
+**server database**, and the question text. LexAI returns a grade and feedback;
+your CBT application stores the result. No LexAI student or question records are
+needed.
 
 ```json
 {
-  "error": "Invalid API key",
-  "message": "The provided API key is invalid or inactive"
+  "student_answer": "Plants use sunlight to make glucose.",
+  "marking_guide": "Photosynthesis converts light energy, water and carbon dioxide into glucose and oxygen.",
+  "question_text": "Explain photosynthesis."
 }
 ```
 
-## Best Practices
+A successful response includes `data.score`, `data.max_score` (5),
+`data.feedback`, `needs_review`, and `model_used: "LexAI 3.0"`. Store a score in
+final totals only when `needs_review` is false. If the API returns `503 SCORE_001`,
+no grade was produced; leave the answer pending and retry or send it for manual
+review. Never turn a failed request into a zero.
 
-1. **Store API Keys Securely**: Never hardcode API keys in your source code. Use environment variables or secure vaults.
+### B. LexAI should also store the assessment records
 
-2. **Use Different Keys for Different Environments**: Create separate API keys for development, testing, and production.
+1. `POST /api/v1/questions` with `question_text` and `marking_guide`; save the
+   returned `question_id` beside your CBT question ID.
+2. `POST /api/v1/students` with `name` and `matric_number`; save the returned
+   `student_id` beside your CBT student ID. Repeating the same matric number for
+   one account returns the existing student.
+3. `POST /api/v1/submit-response` with `student_id`, `question_id`, and `answer`.
+   The response contains `response_id`, `grading_status`, `scoring`, and
+   `student_total_score`. It stores a successfully graded answer.
+4. Read `GET /api/v1/responses/{id}` or filter
+   `GET /api/v1/responses?student_id=...&question_id=...` to reconcile results.
 
-3. **Monitor Your Usage**: Keep track of your API usage to avoid hitting rate limits.
+One student may submit once per LexAI question. A duplicate returns `409 RES_003`.
+Do not automatically retry a submission after a network timeout: the first
+request may already have committed. Query the responses endpoint using the
+student and question IDs first. A `503 SCORE_001` explicitly means nothing was
+saved and can be retried.
 
-4. **Handle Errors Gracefully**: Implement proper error handling in your applications.
+## JavaScript/TypeScript SDK (server side)
 
-5. **Use HTTPS in Production**: Always use HTTPS when connecting to the API in production environments.
+The dependency-free SDK is in [`sdk/javascript`](sdk/javascript). Use Node.js
+18 or newer. Install it into your CBT server project:
 
-6. **Rotate Keys Regularly**: Regularly rotate your API keys to maintain security.
+```bash
+npm install @lexical-ai/lexai-cbt-sdk
+```
 
-## Support
+```js
+import { LexAIClient, LexAIError } from '@lexical-ai/lexai-cbt-sdk';
 
-For support, please refer to the API documentation at `/api/v1/docs/` when the service is running, or contact the AI-CBT team.
+const lexai = new LexAIClient({
+  apiKey: process.env.LEXAI_API_KEY,
+  baseUrl: process.env.LEXAI_BASE_URL ?? 'https://apilexaia.altrisco.tech/api/v1',
+});
+
+// In your authenticated CBT backend handler, fetch question and marking guide
+// from your own database. Check that the student owns this attempt first.
+const result = await lexai.scoreAnswer({
+  studentAnswer: answerFromStudent,
+  markingGuide: questionFromDatabase.markingGuide,
+  questionText: questionFromDatabase.text,
+});
+
+if (result.needs_review) {
+  // Keep pending for a lecturer; do not add to the final score yet.
+} else {
+  // Persist result.data.score (out of 5) and result.data.feedback.
+}
+```
+
+The SDK also has `generateQuestions`, `createQuestion`, `createStudent`, `submitResponse`,
+`getResponse`, and `listResponses`. It throws `LexAIError` with `status`, `code`,
+and `requestId` for API failures. It does **not** retry a POST automatically.
+See [`sdk/javascript/README.md`](sdk/javascript/README.md) for method details.
+For a typed CBT server handler, see
+[`examples/cbt_server_example.ts`](examples/cbt_server_example.ts).
+
+## Generate question drafts
+
+Call `generateQuestions` from a teacher-authorized server route. It accepts a
+subject, topics, question count, types (`MCQ`, `FILL_BLANK`, `THEORY`), and a
+difficulty. The response contains editable drafts with marking guides. Review
+the content before publishing an assessment.
+
+```js
+const result = await lexai.generateQuestions({
+  subject: 'Science',
+  topics: ['Solar system'],
+  count: 7,
+  questionTypes: ['MCQ', 'FILL_BLANK', 'THEORY'],
+  difficulty: 'mixed',
+});
+console.log(result.data.questions, result.data.warnings);
+```
+
+The HTTP equivalent is `POST /api/v1/generate-questions` with `X-API-Key`.
+The LexLearn CBT backend exposes this through its own teacher-only
+`POST /api/assessments/generate-questions` route.
+
+## Direct HTTP request
+
+If your CBT backend uses another language, no SDK is required:
+
+```bash
+curl "$LEXAI_BASE_URL/score" \
+  -H "X-API-Key: $LEXAI_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"student_answer":"Paris","marking_guide":"Paris is the capital of France.","question_text":"What is the capital of France?"}'
+```
+
+Set `LEXAI_BASE_URL` to the full API URL ending in `/api/v1`. Use HTTPS when
+calling a deployed backend. The API key belongs in the `X-API-Key` header; query
+string keys are not supported.
+
+## Grades and errors
+
+- `score` is a whole number from 0 to 5. Scale it to your CBT question's points
+  only after deciding how your assessment should round fractional points.
+- `needs_review: true` means the grade is provisional. Stored responses with
+  `grading_status: "needs_review"` are excluded from the LexAI student total.
+- `401 AUTH_001` or `AUTH_002`: missing, invalid, or revoked integration key.
+- `429 RATE_001` or `RATE_002`: rate or monthly quota exceeded. Inspect the
+  `X-RateLimit-*` headers and queue work for later.
+- `503 SCORE_001`: grading unavailable; never record zero for this case.
+- All errors have `error.code`, `error.message`, `request_id`, and `timestamp`.
+  Keep `request_id` in your logs to trace a failed integration call.

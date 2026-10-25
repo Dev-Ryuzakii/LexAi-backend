@@ -1,3 +1,5 @@
+> **Legacy document.** Use [API_INTEGRATION_GUIDE.md](API_INTEGRATION_GUIDE.md) and [API_DOCUMENTATION.md](API_DOCUMENTATION.md) for the current Cencori-backed API and key flow.
+
 # AI-CBT Assessment API Service
 
 ## Overview

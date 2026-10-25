@@ -1,464 +1,133 @@
-# AI-CBT API Documentation
+# LexAI CBT API reference
 
-## Overview
+The API grades theory answers from 0 to 5. The default grader is LexAI 3.0,
+powered by Cencori. For architecture and SDK setup, read the
+[integration guide](API_INTEGRATION_GUIDE.md).
 
-The AI-CBT Assessment Platform provides a comprehensive RESTful API for integrating AI-powered educational assessment capabilities into your applications. The API supports multiple AI providers including Ollama, Google PaLM, Cohere, and Hugging Face, with automatic fallback mechanisms to ensure maximum uptime.
-
-## Features
-- 🤖 **AI-Powered Scoring**: Uses Ollama AI models for intelligent answer evaluation
-- 📚 **Question Management**: CRUD operations for assessment questions
-- 👥 **Student Management**: Student registration and response tracking
-- 🔒 **API Key Authentication**: Secure access control
-- 📊 **Detailed Feedback**: Comprehensive scoring with strengths/weaknesses analysis
-- 🔄 **Fallback Systems**: Multiple scoring methods for reliability
-
-## Base URL
-```
-http://localhost:5001/api/v1
-```
+Base URL for local development: `http://127.0.0.1:5001/api/v1`.
+Hosted base URL: `https://apilexaia.altrisco.tech/api/v1`.
 
 ## Authentication
 
-All API endpoints (except `/api/v1/health` and `/api/v1/docs`) require authentication via API key. You can provide the API key in two ways:
+- `GET /health`, `POST /register`, and `POST /login` are public.
+- Account management endpoints (`/api-keys` and `/logout`) use a login session:
+  `Authorization: Bearer <session-token>`.
+- Scoring and assessment endpoints accept either a login session or a LexAI API
+  key: `X-API-Key: lexai_...`. The API key belongs on your CBT **server**, not in
+  the browser. Keys in query parameters are not accepted.
+- Create an account with `POST /register` using `email` and `password`. Log in
+  with the same fields at `POST /login`, then create a key with
+  `POST /api-keys` and `{"key_name":"CBT server","plan_type":"production"}`.
+  The key is returned once in `api_key.api_key`. Plans are `test` and
+  `production`; there are no built-in development keys.
 
-1. **Header**: `X-API-Key: your_api_key`
-2. **Query Parameter**: `?api_key=your_api_key`
+## Stateless grading
 
-### Available API Keys (Development)
+`POST /score` is the simplest integration when your CBT project already stores
+questions and students. JSON body:
 
-- **Development**: `YOUR_API_KEY`
-- **Testing**: `YOUR_API_KEY`
-
-For production use, please generate your own API keys through the admin panel.
-
-### AI Service Configuration
-
-The platform supports multiple AI providers with the following priority order:
-
-1. **Active Service** (configurable)
-2. Ollama (default fallback)
-3. Google PaLM
-4. Cohere
-5. Hugging Face
-6. Traditional ML model
-7. Basic text similarity
-
-To configure cloud-based AI services, set the appropriate API keys in the environment variables or through the admin configuration panel.
-
-## API Endpoints
-
-### 1. Health Check
-```http
-GET /api/v1/health
-```
-Check API service status and availability.
-
-**Response:**
-```
-{
-  "status": "healthy",
-  "timestamp": "2025-07-21T18:45:00",
-  "version": "1.0.0",
-  "services": {
-    "ollama": true,
-    "database": true
-  }
-}
-```
-
-### 2. Score Answer
-```http
-POST /api/v1/score
-```
-Score a student answer against a marking guide using AI.
-
-**Headers:**
-```
-X-API-Key: YOUR_API_KEY
-Content-Type: application/json
-```
-
-**Request Body:**
-``json
-{
-  "student_answer": "Photosynthesis is the process by which plants make food using sunlight and carbon dioxide.",
-  "marking_guide": "Photosynthesis is the process where plants convert light energy into chemical energy using chlorophyll, water, and carbon dioxide to produce glucose and oxygen.",
-  "question_text": "Explain the process of photosynthesis."
-}
-```
-
-**Response:**
 ```json
 {
-  "timestamp": "2025-07-21T18:45:00",
-  "request_id": "uuid-here",
+  "student_answer": "Paris",
+  "marking_guide": "Paris is the capital of France.",
+  "question_text": "What is the capital of France?"
+}
+```
+
+Example successful response (other metadata fields omitted):
+
+```json
+{
   "success": true,
-  "scoring_method": "ollama",
+  "scoring_method": "lexai",
+  "model_used": "LexAI 3.0",
+  "needs_review": false,
   "data": {
-    "score": 4,
-    "confidence": 0.85,
-    "feedback": "Good understanding of photosynthesis. Mentioned key components but could include more detail about oxygen production.",
-    "strengths": ["Correctly identified sunlight as energy source", "Mentioned carbon dioxide"],
-    "weaknesses": ["Did not mention oxygen as byproduct", "Missing role of chlorophyll"]
+    "score": 5,
+    "max_score": 5,
+    "confidence": 0.99,
+    "feedback": "The answer is correct.",
+    "strengths": ["Correct answer"],
+    "weaknesses": []
   }
 }
 ```
 
-### 3. Get Questions
-```http
-GET /api/v1/questions
-```
-Retrieve all available assessment questions.
+`question_text` is optional. `student_answer` and `marking_guide` are required.
+A result marked `needs_review` is provisional; exclude it from final totals
+until a lecturer confirms it. `503 SCORE_001` means no grade was produced.
 
-**Headers:**
-```
-X-API-Key: YOUR_API_KEY
-```
+## Question generation
 
-**Response:**
+`POST /generate-questions` creates editable CBT question drafts using LexAI 3.0.
+It requires the same authentication as `/score`. Example body:
+
 ```json
 {
-  "questions": [
-    {
-      "id": 1,
-      "question_text": "Explain the process of photosynthesis.",
-      "marking_guide": "Detailed marking rubric...",
-      "created_at": "2025-07-21T10:00:00"
-    }
-  ],
-  "total_count": 1,
-  "timestamp": "2025-07-21T18:45:00"
+  "subject": "Science",
+  "topics": ["Solar system"],
+  "count": 7,
+  "question_types": ["MCQ", "FILL_BLANK", "THEORY"],
+  "difficulty": "mixed"
 }
 ```
 
-### 4. Create Question
-```http
-POST /api/v1/questions
-```
-Create a new assessment question.
+The response has `data.questions` and `data.warnings`. Each question includes
+its text, type, answer, and marking guide. Teachers should review drafts
+before using them in an assessment.
 
-**Headers:**
-```
-X-API-Key: YOUR_API_KEY
-Content-Type: application/json
-```
+## Stored assessment flow
 
-**Request Body:**
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/questions` | Create with `question_text`, `marking_guide`; returns `question_id` |
+| `GET`, `PUT`, `DELETE` | `/questions/{id}` | Read or manage an owned question |
+| `GET` | `/questions` | List owned questions |
+| `POST` | `/students` | Create or find with `name`, `matric_number`; returns `student_id` |
+| `GET`, `PUT`, `DELETE` | `/students/{id}` | Read or manage an owned student |
+| `GET` | `/students` | List owned students |
+| `POST` | `/submit-response` | Grade and store `student_id`, `question_id`, `answer` |
+| `GET` | `/responses/{id}` | Read a stored response |
+| `GET` | `/responses` | List or filter by `student_id`, `question_id`, `grading_status` |
+| `POST` | `/responses` | Store an ungraded answer for manual review |
+| `PUT`, `DELETE` | `/responses/{id}` | Lecturer score override or deletion |
+| `GET` | `/student/{id}/responses` | Read a student's responses |
+
+`POST /submit-response` returns HTTP 201 with `response_id`,
+`grading_status`, `scoring` (including `score`, `max_score`, `feedback`,
+`model_used`, and `needs_review`), and `student_total_score`. One student can
+submit only once per question. A duplicate returns `409 RES_003`.
+A failed grading request returns `503 SCORE_001` and saves nothing.
+
+## Account and service endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Database and provider status; provider configuration is listed as `lexai` |
+| `POST` | `/register` | Create account |
+| `POST` | `/login` | Obtain session token |
+| `POST` | `/logout` | Revoke current session token |
+| `GET`, `POST` | `/api-keys` | List or create keys; session required |
+| `DELETE` | `/api-keys/{id}` | Revoke key; session required |
+| `POST` | `/api-keys/{id}/rotate` | Rotate key; session required |
+
+## Errors and limits
+
+Errors return HTTP 4xx or 5xx and a JSON body:
+
 ```json
 {
-  "question_text": "What is the capital of France?",
-  "marking_guide": "The capital of France is Paris. Accept variations like 'Paris, France' or 'Paris is the capital'."
+  "success": false,
+  "error": {"code": "SCORE_001", "message": "The answer could not be graded right now.", "details": {}},
+  "message": "The answer could not be graded right now.",
+  "request_id": "request-id",
+  "timestamp": "2026-10-25T00:00:00"
 }
 ```
 
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Question created successfully",
-  "question_id": 2,
-  "timestamp": "2025-07-21T18:45:00"
-}
-```
-
-### 5. Create/Get Student
-```http
-POST /api/v1/students
-```
-Create a new student or retrieve existing student information.
-
-**Headers:**
-```
-X-API-Key: YOUR_API_KEY
-Content-Type: application/json
-```
-
-**Request Body:**
-```json
-{
-  "name": "John Doe",
-  "matric_number": "A12345678"
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Student created successfully",
-  "student_id": 1,
-  "student": {
-    "id": 1,
-    "name": "John Doe",
-    "matric_number": "A12345678",
-    "score": 0
-  },
-  "timestamp": "2025-07-21T18:45:00"
-}
-```
-
-### 6. Submit Response
-```http
-POST /api/v1/submit-response
-```
-Submit and automatically score a student response.
-
-**Headers:**
-```
-X-API-Key: YOUR_API_KEY
-Content-Type: application/json
-```
-
-**Request Body:**
-```json
-{
-  "student_id": 1,
-  "question_id": 1,
-  "answer": "Photosynthesis is how plants make food from sunlight."
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Response submitted and scored successfully",
-  "response_id": 1,
-  "scoring": {
-    "score": 3,
-    "max_score": 5,
-    "feedback": "Basic understanding shown. Consider including more scientific details.",
-    "confidence": 0.75,
-    "strengths": ["Correct basic concept"],
-    "weaknesses": ["Lacks scientific terminology", "Missing key processes"],
-    "method": "ollama"
-  },
-  "student_total_score": 3,
-  "timestamp": "2025-07-21T18:45:00"
-}
-```
-
-### 7. Get Student Responses
-```http
-GET /api/v1/student/{student_id}/responses
-```
-Retrieve all responses for a specific student.
-
-**Headers:**
-```
-X-API-Key: YOUR_API_KEY
-```
-
-**Response:**
-```json
-{
-  "student": {
-    "id": 1,
-    "name": "John Doe",
-    "matric_number": "A12345678",
-    "total_score": 3
-  },
-  "responses": [
-    {
-      "response_id": 1,
-      "question": {
-        "id": 1,
-        "text": "Explain photosynthesis.",
-        "marking_guide": "..."
-      },
-      "answer": "Photosynthesis is how plants make food from sunlight.",
-      "score": 3,
-      "ai_feedback": "Basic understanding shown...",
-      "ai_confidence": 0.75,
-      "submitted_at": "2025-07-21T18:45:00"
-    }
-  ],
-  "total_responses": 1,
-  "timestamp": "2025-07-21T18:45:00"
-}
-```
-
-## Error Responses
-
-### Authentication Error (401)
-```json
-{
-  "error": "Invalid or missing API key",
-  "message": "Please provide a valid API key in X-API-Key header or api_key parameter"
-}
-```
-
-### Validation Error (400)
-```json
-{
-  "error": "Missing required fields",
-  "message": "Both student_answer and marking_guide are required"
-}
-```
-
-### Not Found Error (404)
-```json
-{
-  "error": "Student not found"
-}
-```
-
-### Server Error (500)
-```json
-{
-  "error": "Internal server error",
-  "message": "Detailed error description"
-}
-```
-
-## Integration Examples
-
-### Python Example
-```python
-import requests
-import json
-
-# Configuration
-API_BASE = "http://localhost:5001/api/v1"
-API_KEY = "YOUR_API_KEY"
-
-headers = {
-    "X-API-Key": API_KEY,
-    "Content-Type": "application/json"
-}
-
-# 1. Create a student
-student_data = {
-    "name": "Alice Smith",
-    "matric_number": "B98765432"
-}
-
-response = requests.post(f"{API_BASE}/students", 
-                        headers=headers, 
-                        json=student_data)
-student = response.json()
-student_id = student['student_id']
-
-# 2. Create a question
-question_data = {
-    "question_text": "What is machine learning?",
-    "marking_guide": "Machine learning is a subset of AI that enables computers to learn without explicit programming."
-}
-
-response = requests.post(f"{API_BASE}/questions", 
-                        headers=headers, 
-                        json=question_data)
-question = response.json()
-question_id = question['question_id']
-
-# 3. Submit and score a response
-submission_data = {
-    "student_id": student_id,
-    "question_id": question_id,
-    "answer": "Machine learning helps computers learn from data automatically."
-}
-
-response = requests.post(f"{API_BASE}/submit-response", 
-                        headers=headers, 
-                        json=submission_data)
-result = response.json()
-print(f"Score: {result['scoring']['score']}/5")
-print(f"Feedback: {result['scoring']['feedback']}")
-```
-
-### JavaScript/Node.js Example
-```javascript
-const axios = require('axios');
-
-const API_BASE = 'http://localhost:5001/api/v1';
-const API_KEY = 'YOUR_API_KEY';
-
-const headers = {
-    'X-API-Key': API_KEY,
-    'Content-Type': 'application/json'
-};
-
-async function scoreAnswer(studentAnswer, markingGuide, questionText = '') {
-    try {
-        const response = await axios.post(`${API_BASE}/score`, {
-            student_answer: studentAnswer,
-            marking_guide: markingGuide,
-            question_text: questionText
-        }, { headers });
-        
-        return response.data;
-    } catch (error) {
-        console.error('Error scoring answer:', error.response.data);
-        throw error;
-    }
-}
-
-// Usage
-scoreAnswer(
-    "The water cycle involves evaporation, condensation, and precipitation.",
-    "The water cycle is the continuous movement of water through evaporation, condensation, precipitation, and collection.",
-    "Describe the water cycle."
-).then(result => {
-    console.log('Scoring Result:', result);
-});
-```
-
-### cURL Examples
-```bash
-# Health check
-curl -X GET "http://localhost:5001/api/v1/health"
-
-# Score an answer
-curl -X POST "http://localhost:5001/api/v1/score" \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_answer": "Gravity is a force that pulls objects toward Earth.",
-    "marking_guide": "Gravity is the force of attraction between masses, particularly noticeable as objects being pulled toward Earth.",
-    "question_text": "What is gravity?"
-  }'
-
-# Get all questions
-curl -X GET "http://localhost:5001/api/v1/questions" \
-  -H "X-API-Key: YOUR_API_KEY"
-```
-
-## Use Cases
-
-### 1. Learning Management Systems (LMS)
-Integrate AI-powered assessment into existing LMS platforms for automatic grading and detailed feedback.
-
-### 2. Educational Apps
-Add intelligent tutoring capabilities to mobile or web applications.
-
-### 3. Online Course Platforms
-Provide instant feedback and scoring for course assessments.
-
-### 4. Corporate Training Systems
-Assess employee knowledge and provide personalized feedback.
-
-### 5. Research Applications
-Analyze learning patterns and assessment effectiveness.
-
-## Best Practices
-
-1. **Rate Limiting**: Implement rate limiting on your client side to avoid overwhelming the API
-2. **Error Handling**: Always handle potential API errors gracefully
-3. **Caching**: Cache frequently accessed data like questions to reduce API calls
-4. **Monitoring**: Monitor API usage and response times
-5. **Security**: Store API keys securely and rotate them regularly
-
-## Support and Documentation
-
-- **API Documentation**: `GET /api/v1/docs`
-- **Health Status**: `GET /api/v1/health`
-- **GitHub Repository**: [Your repo URL]
-- **Support Email**: [Your support email]
-
-## Changelog
-
-### Version 1.0.0
-- Initial API release
-- Basic CRUD operations for questions and students
-- AI-powered scoring with Ollama integration
-- Comprehensive error handling and documentation
+Common codes: `AUTH_001` missing credentials, `AUTH_002` invalid credentials,
+`AUTH_003` session required, `VAL_001` validation error, `RES_001` not found,
+`RES_003` duplicate response, `RATE_001` hourly rate limit, `RATE_002` monthly
+quota, `SCORE_001` grading unavailable. Rate headers are
+`X-RateLimit-Limit`, `X-RateLimit-Used`, `X-RateLimit-Remaining`, and
+`X-RateLimit-Reset`. Record `request_id` when investigating a failed request.

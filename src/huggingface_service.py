@@ -9,7 +9,7 @@ import time
 import hashlib
 from datetime import datetime
 from typing import Dict, Any, Optional
-from ollama_service import ResponseCache
+from grading_helpers import ResponseCache
 from scoring import StrictScoringMixin
 
 # Configure logging

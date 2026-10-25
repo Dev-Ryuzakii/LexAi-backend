@@ -1,0 +1,25 @@
+{
+  "name": "@lexical-ai/lexai-cbt-sdk",
+  "version": "0.1.1",
+  "description": "Server-side JavaScript and TypeScript client for LexAI 3.0 CBT grading and question generation",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dev-Ryuzakii/LexAi-backend.git",
+    "directory": "sdk/javascript"
+  },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -4,20 +4,22 @@ AI-assisted grading API for computer-based tests. Schools' CBT systems (and the
 [LexAi frontend](https://github.com/Dev-Ryuzakii/LexAi-frontend), a separate repo) call it
 to grade theory answers against a marking guide.
 
-Grading uses Ollama first, then PaLM, Cohere or Hugging Face when their keys are set. If none
+Grading uses Cencori with `gpt-6-luna` by default, shown to API users as **LexAI 3.0**.
+PaLM, Cohere or Hugging Face can be used as fallback providers when their keys are set. If none
 of them can grade, the API either reports that grading failed or returns a text-similarity
 estimate marked for lecturer review. It never presents a failure as a zero, or a guess as a grade.
 
 ## Quick start
 
 Requires Python 3.11+. Redis is optional (it shares rate-limit and quota counters across
-workers), and Ollama is needed for AI grading.
+workers). A Cencori project key is needed for LexAI 3.0 grading.
 
 ```bash
 python -m venv venv
 source venv/bin/activate            # Windows: venv\Scripts\activate
 pip install -r requirements-dev.txt
 cp .env.example .env                # then edit
+# Set CENCORI_API_KEY in .env to a project key from https://console.cencori.com/home
 alembic upgrade head                # create/upgrade the database
 python src/app_api.py               # http://127.0.0.1:5001/api/v1/
 ```
@@ -25,9 +27,13 @@ python src/app_api.py               # http://127.0.0.1:5001/api/v1/
 Or run `./start.sh` (or `start_platform.bat` on Windows), which does the same.
 
 With Docker, `docker compose up --build` runs migrations and serves with gunicorn on port 5001.
-It expects Ollama on the host at `http://host.docker.internal:11434`.
+Set `CENCORI_API_KEY` in `.env` before starting the container.
 
 All settings are environment variables. `.env.example` lists every variable and its default.
+
+To connect an existing CBT project, follow the [integration guide](API_INTEGRATION_GUIDE.md).
+It covers server-side API keys, grading with your own records, storing assessments
+in LexAI, and the [JavaScript/TypeScript SDK](sdk/javascript/README.md).
 
 ## Authentication
 
@@ -131,7 +137,7 @@ pytest
 ```
 
 The suite runs in-process with a temporary SQLite database and a fake grader, so you don't need a
-server, Redis or Ollama. It checks authentication, isolation between users, key handling, quotas,
+server, Redis or a Cencori key. It checks authentication, isolation between users, key handling, quotas,
 the parser, submission rules and how totals are kept.
 
 ## Training scripts

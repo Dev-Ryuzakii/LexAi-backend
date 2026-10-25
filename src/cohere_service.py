@@ -5,7 +5,7 @@ import cohere
 import os
 import logging
 
-from ollama_service import ResponseCache, OllamaService
+from grading_helpers import ResponseCache, create_scoring_prompt
 from scoring import StrictScoringMixin
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class CohereService(StrictScoringMixin):
             return False
 
     # Same prompt and 0-5 scale as Ollama, so scores from every provider are comparable.
-    _create_scoring_prompt = OllamaService._create_scoring_prompt
+    _create_scoring_prompt = staticmethod(create_scoring_prompt)
 
     def _generate(self, prompt: str) -> str:
         if not self.client:

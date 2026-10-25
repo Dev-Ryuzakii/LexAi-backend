@@ -8,13 +8,13 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY')
     
     # AI Service API Keys (set these as environment variables in production)
-    OLLAMA_API_KEY = os.environ.get('OLLAMA_API_KEY') or ''
+    CENCORI_API_KEY = os.environ.get('CENCORI_API_KEY') or ''
     PALM_API_KEY = os.environ.get('PALM_API_KEY') or ''
     COHERE_API_KEY = os.environ.get('COHERE_API_KEY') or ''
     HUGGINGFACE_API_KEY = os.environ.get('HUGGINGFACE_API_KEY') or ''
     
     # AI Service Models
-    OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL') or 'llama3.2:latest'
+    CENCORI_MODEL = os.environ.get('CENCORI_MODEL') or 'gpt-6-luna'
     PALM_MODEL = os.environ.get('PALM_MODEL') or 'chat-bison-001'
     COHERE_MODEL = os.environ.get('COHERE_MODEL') or 'command'
     HUGGINGFACE_MODEL = os.environ.get('HUGGINGFACE_MODEL') or 'google/flan-t5-base'

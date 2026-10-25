@@ -18,10 +18,6 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/database.db}
-      # Ollama running on the host machine
-      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

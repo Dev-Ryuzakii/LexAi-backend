@@ -1,3 +1,5 @@
+> **Legacy document.** Use [API_INTEGRATION_GUIDE.md](API_INTEGRATION_GUIDE.md) and [API_DOCUMENTATION.md](API_DOCUMENTATION.md) for the current Cencori-backed API and key flow.
+
 # API Usage Examples
 
 This document provides examples of how to use the AI-CBT API in both Python and JavaScript.

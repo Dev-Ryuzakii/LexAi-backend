@@ -13,13 +13,10 @@ from scoring import MAX_SCORE, ScoringError
 
 logger = logging.getLogger(__name__)
 
+from grading_helpers import fallback_similarity_score
+
 # Try to import optional dependencies
-try:
-    from ollama_service import ollama_service, fallback_similarity_score
-except ImportError as e:
-    logger.warning(f"Ollama service not available: {e}")
-    ollama_service = None
-    fallback_similarity_score = None
+from cencori_service import cencori_service
 
 try:
     from palm_service import palm_service
@@ -47,8 +44,7 @@ def _env_flag(name: str, default: bool) -> bool:
 class AIServiceManager:
     def __init__(self):
         self.services = {}
-        if ollama_service:
-            self.services['ollama'] = ollama_service
+        self.services['cencori'] = cencori_service
         if palm_service:
             self.services['palm'] = palm_service
         if cohere_service:
@@ -57,7 +53,7 @@ class AIServiceManager:
             self.services['huggingface'] = huggingface_service
 
         self.active_service = next(iter(self.services), None)
-        self.fallback_chain = [s for s in ['ollama', 'palm', 'cohere', 'huggingface'] if s in self.services]
+        self.fallback_chain = [s for s in ['cencori', 'palm', 'cohere', 'huggingface'] if s in self.services]
         self.review_confidence_threshold = float(os.environ.get('REVIEW_CONFIDENCE_THRESHOLD', '0.6'))
         self.allow_similarity_fallback = _env_flag('ALLOW_SIMILARITY_FALLBACK', True)
 
@@ -112,7 +108,7 @@ class AIServiceManager:
         errors = []
         for service_name in service_order:
             service = self.services[service_name]
-            if service_name != 'ollama' and not getattr(service, 'api_key', None):
+            if not getattr(service, 'api_key', None):
                 continue
             try:
                 if not service.check_connection():
@@ -128,7 +124,11 @@ class AIServiceManager:
                 errors.append(f"{service_name}: {e}")
                 continue
 
-            result["scoring_method"] = service_name
+            if service_name == 'cencori':
+                result['model_used'] = service.public_model_name
+                result['scoring_method'] = 'lexai'
+            else:
+                result['scoring_method'] = service_name
             result["max_score"] = MAX_SCORE
             result["needs_review"] = result.get("confidence", 0.0) < self.review_confidence_threshold
             return result
@@ -150,7 +150,9 @@ class AIServiceManager:
                 "provider_errors": errors,
             }
 
-        return self._unavailable("No AI provider could grade this answer" + (f" ({'; '.join(errors)})" if errors else ""))
+        if errors:
+            logger.warning('AI grading unavailable: %s', '; '.join(errors))
+        return self._unavailable("No AI provider could grade this answer")
 
     def get_service_status(self) -> Dict[str, Dict[str, Any]]:
         status = {}
@@ -159,9 +161,13 @@ class AIServiceManager:
                 connected = service.check_connection()
                 health = getattr(service, 'health_status', None)
                 healthy = health.get('healthy', connected) if isinstance(health, dict) else getattr(health, 'healthy', connected)
-                status[name] = {"connected": connected, "healthy": healthy, "model": getattr(service, 'model', 'N/A')}
+                public_name = 'lexai' if name == 'cencori' else name
+                public_model = getattr(service, 'public_model_name', getattr(service, 'model', 'N/A'))
+                status[public_name] = {"connected": connected, "healthy": healthy, "model": public_model}
             except Exception as e:
-                status[name] = {"connected": False, "healthy": False, "error": str(e), "model": getattr(service, 'model', 'N/A')}
+                public_name = 'lexai' if name == 'cencori' else name
+                public_model = getattr(service, 'public_model_name', getattr(service, 'model', 'N/A'))
+                status[public_name] = {"connected": False, "healthy": False, "model": public_model}
         return status
 
 

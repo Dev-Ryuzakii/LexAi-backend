@@ -1,4 +1,7 @@
-# Ollama Integration Guide for AI-CBT Platform
+# Ollama Integration Guide for AI-CBT Platform (Legacy)
+
+This guide covers the old local grader. The active API uses Cencori with
+`gpt-6-luna` as LexAI 3.0; see [AI_SERVICES.md](AI_SERVICES.md) for current setup.
 
 ## Overview
 

@@ -1,102 +1,31 @@
-# AI Services Integration Guide
+# AI grading services
 
-This document explains how to configure and use the multiple AI services integrated into the AI-CBT Assessment Platform.
+The default grader is **LexAI 3.0**, powered by Cencori's `gpt-6-luna` model.
+The model ID and Cencori project key stay on the server. Scoring responses show
+`model_used: "LexAI 3.0"` and `scoring_method: "lexai"`.
 
-## Supported AI Providers
+## Configure Cencori
 
-The platform currently supports the following AI providers:
-
-1. **Ollama** (default) - Local AI inference engine
-2. **Google PaLM/Bard** - Google's large language models
-3. **Cohere** - Advanced language models for NLP tasks
-4. **Hugging Face** - Access to thousands of pre-trained models
-
-## Configuration
-
-To use the AI services, you need to set API keys for the cloud-based providers. This can be done in two ways:
-
-### Method 1: Environment Variables (Recommended for Production)
-
-Set the following environment variables:
+Create a project key in the [Cencori console](https://console.cencori.com/home),
+then set these environment variables on the backend:
 
 ```bash
-# Google PaLM API Key
-export PALM_API_KEY="your_google_palm_api_key"
-
-# Cohere API Key
-export COHERE_API_KEY="your_cohere_api_key"
-
-# Hugging Face API Key
-export HUGGINGFACE_API_KEY="your_huggingface_api_key"
+CENCORI_API_KEY=csk_...
+CENCORI_MODEL=gpt-6-luna
 ```
 
-### Method 2: Direct Configuration in Code
+`CENCORI_BASE_URL` defaults to `https://api.cencori.com/v1`. Keep the key on the
+server; never send it from a browser or commit it to Git. Cencori accepts chat
+completions at `/v1/chat/completions` using Bearer authentication.
 
-You can also set the API keys directly in your code before starting the application:
+## Fallbacks
 
-```python
-from ai_service_manager import ai_service_manager
+If Cencori cannot grade, the manager tries configured PaLM, Cohere and Hugging Face
+services in that order. Set `PALM_API_KEY`, `COHERE_API_KEY`, or
+`HUGGINGFACE_API_KEY` only if you want those fallbacks. If all providers fail,
+`ALLOW_SIMILARITY_FALLBACK=1` permits a text similarity estimate that always needs
+lecturer review. Set it to `0` to return a 503 instead.
 
-# Set API keys
-ai_service_manager.set_api_keys({
-    'palm': 'your_google_palm_api_key',
-    'cohere': 'your_cohere_api_key',
-    'huggingface': 'your_huggingface_api_key'
-})
-
-# Optionally set specific models
-ai_service_manager.set_models({
-    'palm': 'chat-bison-001',
-    'cohere': 'command',
-    'huggingface': 'google/flan-t5-base'
-})
-```
-
-## Service Selection
-
-The platform automatically uses a fallback chain when one service is unavailable:
-
-1. **Active Service** (configurable)
-2. Ollama (default fallback)
-3. Google PaLM
-4. Cohere
-5. Hugging Face
-6. Traditional ML model
-7. Basic text similarity
-
-You can set the active service:
-
-```python
-# Set Google PaLM as the active service
-ai_service_manager.set_active_service('palm')
-```
-
-## Service Health Check
-
-You can check the status of all AI services:
-
-```python
-# Get status of all services
-status = ai_service_manager.get_service_status()
-print(status)
-```
-
-## Default Models
-
-Each service uses the following default models:
-
-- **Ollama**: `llama3.2:latest`
-- **Google PaLM**: `chat-bison-001`
-- **Cohere**: `command`
-- **Hugging Face**: `google/flan-t5-base`
-
-## Usage Priority
-
-The platform follows this priority for scoring student answers:
-
-1. Active service (if configured and available)
-2. Fallback chain through other services
-3. Traditional ML model (if available)
-4. Basic text similarity (as last resort)
-
-This ensures maximum uptime and reliability for scoring student assessments.
+The public `/api/v1/health` response lists the Cencori grader as `lexai` with
+model `LexAI 3.0`. Its `connected` flag means a key is configured; the first
+grading request confirms whether the key and model work.

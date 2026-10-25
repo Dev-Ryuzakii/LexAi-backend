@@ -27,8 +27,9 @@ from database import (
     verify_password,
 )
 from scoring import MAX_SCORE
+from question_generation import DIFFICULTIES, QUESTION_TYPES, GenerationError, generate_questions
 
-API_VERSION = '1.1.0'
+API_VERSION = '1.2.0'
 
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
@@ -365,6 +366,7 @@ def response_json(r: Response) -> Dict[str, Any]:
         'max_score': r.max_score,
         'grading_status': r.grading_status,
         'scoring_method': r.scoring_method,
+        'model_used': 'LexAI 3.0' if r.scoring_method == 'lexai' else None,
         'ai_score': r.ai_score,
         'lecturer_score': r.lecturer_score,
         'ai_feedback': r.ai_feedback,
@@ -510,6 +512,7 @@ def register_api_routes(app):
                 'students': '/api/v1/students',
                 'responses': '/api/v1/responses',
                 'scoring': '/api/v1/score',
+                'generate_questions': '/api/v1/generate-questions',
                 'submit_response': '/api/v1/submit-response',
                 'api_keys': '/api/v1/api-keys',
             },
@@ -559,6 +562,61 @@ def register_api_routes(app):
         if isinstance(metadata, dict):
             payload['metadata'] = metadata
         return jsonify(payload)
+
+    @app.route('/api/v1/generate-questions', methods=['POST'])
+    @require_auth
+    def api_generate_questions():
+        """Generate draft questions; the caller reviews them before publishing."""
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return api_error(400, 'VAL_002', 'Request body must be a JSON object')
+        subject = body.get('subject')
+        topics = body.get('topics')
+        count = body.get('count')
+        question_types = body.get('question_types')
+        difficulty = body.get('difficulty', 'mixed')
+        if not isinstance(subject, str) or not 1 <= len(subject.strip()) <= 200:
+            return api_error(400, 'VAL_001', 'subject must be 1-200 characters')
+        if not isinstance(topics, list) or not 1 <= len(topics) <= 10 or any(
+            not isinstance(topic, str) or not 1 <= len(topic.strip()) <= 200 for topic in topics
+        ):
+            return api_error(400, 'VAL_001', 'topics must contain 1-10 short strings')
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 10:
+            return api_error(400, 'VAL_001', 'count must be an integer from 1 to 10')
+        if not isinstance(question_types, list) or not question_types or any(
+            not isinstance(kind, str) or kind not in QUESTION_TYPES for kind in question_types
+        ):
+            return api_error(400, 'VAL_001', 'question_types must contain MCQ, FILL_BLANK, or THEORY')
+        if not isinstance(difficulty, str) or difficulty not in DIFFICULTIES:
+            return api_error(400, 'VAL_001', 'difficulty must be easy, medium, hard, or mixed')
+        fields = {'level': 100, 'instructions': 2000, 'source_material': 20000}
+        for field, limit in fields.items():
+            value = body.get(field, '')
+            if not isinstance(value, str) or len(value) > limit:
+                return api_error(400, 'VAL_001', f'{field} must be a string of at most {limit} characters')
+        avoid = body.get('avoid_questions', [])
+        if not isinstance(avoid, list) or len(avoid) > 100 or any(
+            not isinstance(item, str) or len(item) > 1000 for item in avoid
+        ):
+            return api_error(400, 'VAL_001', 'avoid_questions must contain at most 100 short strings')
+
+        spec = {
+            'subject': subject.strip(),
+            'topics': [topic.strip() for topic in topics],
+            'count': count,
+            'question_types': list(dict.fromkeys(question_types)),
+            'difficulty': difficulty,
+            'level': body.get('level', '').strip(),
+            'instructions': body.get('instructions', '').strip(),
+            'source_material': body.get('source_material', '').strip(),
+            'avoid_questions': [item.strip() for item in avoid if item.strip()],
+        }
+        try:
+            data = generate_questions(spec)
+        except GenerationError as exc:
+            return api_error(exc.status, 'GEN_001', str(exc))
+        return jsonify({'success': True, 'data': data, 'model_used': 'LexAI 3.0',
+                        'request_id': g.request_id, 'timestamp': now_iso()})
 
     # --- Questions --------------------------------------------------------------------------
 
@@ -894,6 +952,7 @@ def register_api_routes(app):
                 'strengths': response.ai_strengths,
                 'weaknesses': response.ai_weaknesses,
                 'method': result['scoring_method'],
+                'model_used': result['model_used'],
                 'needs_review': result['needs_review'],
             },
             'student_total_score': total,
@@ -922,6 +981,7 @@ def register_api_routes(app):
             'ai_score': r.ai_score,
             'ai_feedback': r.ai_feedback,
             'ai_confidence': r.ai_confidence,
+            'model_used': 'LexAI 3.0' if r.scoring_method == 'lexai' else None,
             'ai_strengths': r.ai_strengths,
             'ai_weaknesses': r.ai_weaknesses,
             'submitted_at': _iso(r.created_at),
