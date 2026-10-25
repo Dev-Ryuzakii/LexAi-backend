@@ -10,6 +10,41 @@ export class LexAIError extends Error {
   }
 }
 
+/** Allocate one exam/course/test total across questions in exact hundredths. */
+export function allocateQuestionScores({ totalMaxScore, questions }) {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    throw new TypeError('questions must be a non-empty array');
+  }
+  if (typeof totalMaxScore !== 'number' || !Number.isFinite(totalMaxScore) || totalMaxScore < 0.01 ||
+      Math.round(totalMaxScore * 100) / 100 !== totalMaxScore) {
+    throw new TypeError('totalMaxScore must be positive, with at most two decimal places');
+  }
+  const totalCents = Math.round(totalMaxScore * 100);
+  const scores = questions.map(question => {
+    if (question === null || typeof question !== 'object') throw new TypeError('Each question must be an object');
+    if (question.maxScore === undefined) return null;
+    const value = question.maxScore;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0.01 || value > 1000 ||
+        Math.round(value * 100) / 100 !== value) {
+      throw new TypeError('Each question maxScore must be 0.01–1000, with at most two decimal places');
+    }
+    return Math.round(value * 100);
+  });
+  const fixed = scores.reduce((sum, value) => sum + (value ?? 0), 0);
+  const open = scores.filter(value => value === null).length;
+  const remaining = totalCents - fixed;
+  if (open === 0 && remaining !== 0) throw new RangeError('Question maxScore values must add up to totalMaxScore');
+  if (open > 0 && (remaining < open || remaining > open * 100000)) {
+    throw new RangeError('Not enough valid marks remain for questions without maxScore');
+  }
+  const each = open ? Math.floor(remaining / open) : 0;
+  let extra = open ? remaining % open : 0;
+  return scores.map(value => {
+    const cents = value ?? each + (extra-- > 0 ? 1 : 0);
+    return cents / 100;
+  });
+}
+
 export class LexAIClient {
   #apiKey;
   #baseUrl;
@@ -106,6 +141,18 @@ export class LexAIClient {
       ...(matricNumber === undefined ? {} : { matric_number: matricNumber }),
       ...(metadata === undefined ? {} : { metadata }),
     }, options);
+  }
+
+  async scoreAssessment({ totalMaxScore, questions }, options) {
+    const maximums = allocateQuestionScores({ totalMaxScore, questions });
+    const results = await Promise.all(questions.map((question, index) =>
+      this.scoreAnswer({ ...question, maxScore: maximums[index] }, options)));
+    return {
+      score: Math.round(results.reduce((sum, result) => sum + result.data.score, 0) * 100) / 100,
+      maxScore: totalMaxScore,
+      needsReview: results.some(result => result.needs_review),
+      results,
+    };
   }
 
   generateQuestions({ subject, topics, count, questionTypes, difficulty = 'mixed', level = '',

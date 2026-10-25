@@ -8,7 +8,7 @@ npm install @lexical-ai/lexai-cbt-sdk
 ```
 
 ```js
-import { LexAIClient } from '@lexical-ai/lexai-cbt-sdk';
+import { LexAIClient, allocateQuestionScores } from '@lexical-ai/lexai-cbt-sdk';
 
 const client = new LexAIClient({
   apiKey: process.env.LEXAI_API_KEY,
@@ -29,18 +29,45 @@ console.log(result.model_used, result.data.score, result.needs_review);
 The default base URL is `https://apilexaia.altrisco.tech/api/v1`. Pass
 `baseUrl` to the constructor to use a local or other LexAI deployment.
 
-Set `defaultMaxScore` on a client used for one course, exam, or test. It applies
+Set `defaultMaxScore` on a client used for one course, exam, or test when every
+question should start with the same maximum. It applies
 to `scoreAnswer` and `createQuestion`. Pass `maxScore` on either call to override
 it for one question. Stored questions keep their maximum, which `submitResponse`
 uses when grading. Updating a question's maximum affects future submissions;
 previously stored response grades keep their original maximum. Scores can be
 0.01–1000 points, with up to two decimal places. The default is 5.
 
+For **one total across the whole exam**, pass every question to
+`scoreAssessment`. Set `maxScore` on selected questions; the remaining marks
+are split evenly, to the cent, among questions without it. The sum always
+equals `totalMaxScore`. This method makes one stateless API call per question
+and returns each grade plus the aggregate. If `needsReview` is true, treat the
+aggregate as provisional.
+
+```js
+const exam = await client.scoreAssessment({
+  totalMaxScore: 100,
+  questions: [
+    { studentAnswer: 'A1', markingGuide: 'Guide 1', maxScore: 40 },
+    { studentAnswer: 'A2', markingGuide: 'Guide 2' }, // 30 marks
+    { studentAnswer: 'A3', markingGuide: 'Guide 3' }, // 30 marks
+  ],
+});
+console.log(exam.score, exam.maxScore, exam.needsReview);
+
+// For a stored-question flow, use the same allocation before createQuestion:
+const marks = allocateQuestionScores({ totalMaxScore: 100, questions: drafts });
+await Promise.all(drafts.map((draft, index) =>
+  client.createQuestion({ ...draft, maxScore: marks[index] })));
+```
+
 ## Methods
 
 | Method | Purpose |
 |---|---|
 | `scoreAnswer({ studentAnswer, markingGuide, questionText?, maxScore? })` | Grade without storing a LexAI response |
+| `scoreAssessment({ totalMaxScore, questions })` | Grade all answers and sum one exam/course/test total |
+| `allocateQuestionScores({ totalMaxScore, questions })` | Split a total for stored questions without grading |
 | `generateQuestions({ subject, topics, count, questionTypes, ... })` | Generate draft MCQ, fill-blank, or theory questions |
 | `createQuestion({ questionText, markingGuide, maxScore? })` | Save a question and return `question_id` |
 | `createStudent({ name, matricNumber })` | Save or find a student and return `student_id` |

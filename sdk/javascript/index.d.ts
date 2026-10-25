@@ -32,6 +32,20 @@ export interface ScoreResult {
   timestamp: string;
 }
 
+export interface AssessmentQuestion {
+  studentAnswer: string;
+  markingGuide: string;
+  questionText?: string;
+  studentName?: string;
+  matricNumber?: string;
+  metadata?: Record<string, unknown>;
+  /** Overrides this question's share of totalMaxScore. */
+  maxScore?: number;
+}
+
+/** Divide a course, exam, or test total across questions; explicit question marks take priority. */
+export function allocateQuestionScores(input: { totalMaxScore: number; questions: Array<{ maxScore?: number }> }): number[];
+
 export interface GeneratedQuestion {
   type: 'MCQ' | 'FILL_BLANK' | 'THEORY';
   question_text: string;
@@ -100,7 +114,9 @@ export class LexAIError extends Error {
 
 export class LexAIClient {
   constructor(options: ClientOptions);
-  scoreAnswer(input: { studentAnswer: string; markingGuide: string; questionText?: string; studentName?: string; matricNumber?: string; metadata?: Record<string, unknown>; maxScore?: number }, options?: RequestOptions): Promise<ScoreResult>;
+  scoreAnswer(input: AssessmentQuestion, options?: RequestOptions): Promise<ScoreResult>;
+  /** Statelessly grade every question and sum the scores. A score is provisional when needsReview is true. */
+  scoreAssessment(input: { totalMaxScore: number; questions: AssessmentQuestion[] }, options?: RequestOptions): Promise<{ score: number; maxScore: number; needsReview: boolean; results: ScoreResult[] }>;
   generateQuestions(input: { subject: string; topics: string[]; count: number; questionTypes: Array<'MCQ' | 'FILL_BLANK' | 'THEORY'>; difficulty?: 'easy' | 'medium' | 'hard' | 'mixed'; level?: string; instructions?: string; sourceMaterial?: string; avoidQuestions?: string[] }, options?: RequestOptions): Promise<GenerationResult>;
   createQuestion(input: { questionText: string; markingGuide: string; maxScore?: number }, options?: RequestOptions): Promise<{ success: true; question_id: number }>;
   createStudent(input: { name: string; matricNumber: string }, options?: RequestOptions): Promise<{ success: true; student_id: number }>;

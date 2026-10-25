@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LexAIClient, LexAIError } from './index.js';
+import { LexAIClient, LexAIError, allocateQuestionScores } from './index.js';
 
 const endpoint = 'https://apilexaia.altrisco.tech/api/v1';
 
@@ -95,4 +95,33 @@ test('client default and per-question score overrides', async () => {
   assert.deepEqual(bodies.map(body => body.max_score), [20, 2.5, 20, 10]);
   assert.throws(() => new LexAIClient({ apiKey: 'key', defaultMaxScore: 0 }), /maxScore/);
   assert.throws(() => client.createQuestion({ questionText: 'Q', markingGuide: 'A', maxScore: 1.234 }), /maxScore/);
+});
+
+test('allocates one assessment total with exact cents and question overrides', () => {
+  assert.deepEqual(allocateQuestionScores({ totalMaxScore: 100, questions: Array.from({ length: 7 }, () => ({})) }),
+    [14.29, 14.29, 14.29, 14.29, 14.28, 14.28, 14.28]);
+  assert.deepEqual(allocateQuestionScores({ totalMaxScore: 100, questions: [{ maxScore: 40 }, {}, {}] }),
+    [40, 30, 30]);
+  assert.throws(() => allocateQuestionScores({ totalMaxScore: 10, questions: [{ maxScore: 11 }, {}] }), RangeError);
+  assert.throws(() => allocateQuestionScores({ totalMaxScore: 10, questions: [{ maxScore: 4 }, { maxScore: 5 }] }), RangeError);
+  assert.throws(() => allocateQuestionScores({ totalMaxScore: 0.01, questions: [{}, {}] }), RangeError);
+});
+
+test('scores an assessment against its overall maximum', async () => {
+  const maximums = [];
+  const client = new LexAIClient({ apiKey: 'server-secret', fetchImpl: async (_url, options) => {
+    const body = JSON.parse(options.body);
+    maximums.push(body.max_score);
+    return fakeResponse({ success: true, needs_review: false, data: { score: body.max_score, max_score: body.max_score } });
+  } });
+  const questions = [
+    { studentAnswer: 'a', markingGuide: 'a', maxScore: 60 },
+    { studentAnswer: 'b', markingGuide: 'b' },
+    { studentAnswer: 'c', markingGuide: 'c' },
+  ];
+  const result = await client.scoreAssessment({ totalMaxScore: 100, questions });
+  assert.deepEqual(maximums, [60, 20, 20]);
+  assert.equal(result.score, 100);
+  assert.equal(result.maxScore, 100);
+  assert.equal(result.results.length, 3);
 });

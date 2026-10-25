@@ -111,6 +111,10 @@ if (result.needs_review) {
 The SDK also has `generateQuestions`, `createQuestion`, `createStudent`, `submitResponse`,
 `getResponse`, and `listResponses`. It throws `LexAIError` with `status`, `code`,
 and `requestId` for API failures. It does **not** retry a POST automatically.
+For one total across an entire course, exam, or test, use `scoreAssessment`
+with `totalMaxScore` and all question answers. Explicit per-question `maxScore`
+values are respected and the remainder is distributed evenly. Use
+`allocateQuestionScores` to distribute the same total before storing questions.
 See [`sdk/javascript/README.md`](sdk/javascript/README.md) for method details.
 For a typed CBT server handler, see
 [`examples/cbt_server_example.ts`](examples/cbt_server_example.ts).
