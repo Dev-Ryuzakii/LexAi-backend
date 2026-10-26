@@ -4,6 +4,8 @@ LexAi API routes.
 Every assessment record (question, student, response) belongs to the user who
 created it, and every query is scoped to the authenticated user.
 """
+import hashlib
+import ipaddress
 import logging
 import math
 import os
@@ -17,13 +19,13 @@ from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 import redis
-from flask import g, jsonify, request
+from flask import g, jsonify, make_response, request
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ai_service_manager import ai_service_manager
 from database import (
-    APIKey, AuthToken, GRADED, NEEDS_REVIEW, Question, Response, SessionLocal, Student, User,
+    APIKey, ApiUsage, AuthToken, GRADED, IdempotencyRecord, IPRule, NEEDS_REVIEW, Question, Response, SessionLocal, Student, User,
     effective_score, hash_password, hash_secret, password_needs_rehash, recalculate_student_score,
     verify_password,
 )
@@ -90,10 +92,13 @@ class Counter:
             logger.warning(f"Redis unavailable, using per-process rate limiting: {e}")
 
     def incr(self, key: str, ttl_seconds: int) -> int:
+        return self.incr_by(key, 1, ttl_seconds)
+
+    def incr_by(self, key: str, amount: int, ttl_seconds: int) -> int:
         if self.redis is not None:
             try:
-                count = self.redis.incr(key)
-                if count == 1:
+                count = self.redis.incrby(key, amount)
+                if count == amount:
                     self.redis.expire(key, ttl_seconds)
                 return int(count)
             except Exception as e:
@@ -103,7 +108,7 @@ class Counter:
             count, expires = self._memory.get(key, (0, now + ttl_seconds))
             if expires <= now:
                 count, expires = 0, now + ttl_seconds
-            count += 1
+            count += amount
             self._memory[key] = (count, expires)
             if len(self._memory) > 50000:
                 self._memory = {k: v for k, v in self._memory.items() if v[1] > now}
@@ -115,7 +120,7 @@ counter = Counter()
 
 # --- Errors, sessions, validation ----------------------------------------------------
 
-def api_error(status: int, code: str, message: str, **details):
+def api_error(status: int, code: str, message: str, retry_after: Optional[int] = None, **details):
     body = {
         'success': False,
         'error': {'code': code, 'message': message, 'details': details},
@@ -123,7 +128,14 @@ def api_error(status: int, code: str, message: str, **details):
         'request_id': getattr(g, 'request_id', None),
         'timestamp': datetime.utcnow().isoformat(),
     }
-    return jsonify(body), status
+    response = jsonify(body)
+    response.status_code = status
+    if retry_after is None and status == 503:
+        retry_after = 5
+    if retry_after is not None:
+        # Tells clients how long to wait before retrying (seconds).
+        response.headers['Retry-After'] = str(max(int(retry_after), 1))
+    return response
 
 
 def now_iso() -> str:
@@ -136,11 +148,79 @@ def get_db():
     return g.db
 
 
+def validate_fields(data: Dict[str, Any], rules: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Check `data` against `rules`; returns (cleaned values, errors).
+    Rule keys: type (str|int|float|bool|list|dict), required, max_length, min, max, choices, max_items.
+    """
+    cleaned, errors = {}, []
+
+    def fail(field, message, kind, value=None):
+        errors.append({'field': field, 'message': message, 'type': kind, 'input': value})
+
+    for field, rule in rules.items():
+        if field not in data or data[field] is None:
+            if rule.get('required'):
+                fail(field, 'Field is required', 'missing')
+            continue
+        value = data[field]
+        kind = rule['type']
+        if kind is str:
+            if not isinstance(value, str):
+                fail(field, 'Must be a string', 'type_error', value)
+                continue
+            value = value.strip()
+            if rule.get('required') and not value:
+                fail(field, 'Must not be empty', 'value_error')
+                continue
+            if len(value) > rule.get('max_length', 10000):
+                fail(field, f"Must be at most {rule.get('max_length', 10000)} characters", 'value_error')
+                continue
+        elif kind is bool:
+            if not isinstance(value, bool):
+                fail(field, 'Must be true or false', 'type_error', value)
+                continue
+        elif kind in (list, dict):
+            if not isinstance(value, kind):
+                fail(field, f"Must be {'a list' if kind is list else 'an object'}", 'type_error')
+                continue
+            if kind is list and rule.get('required') and not value:
+                fail(field, 'Must not be empty', 'value_error')
+                continue
+            if kind is list and len(value) > rule.get('max_items', 1000):
+                fail(field, f"Must have at most {rule.get('max_items', 1000)} items", 'value_error')
+                continue
+        else:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                fail(field, 'Must be a number', 'type_error', value)
+                continue
+            if kind is int and value != int(value):
+                fail(field, 'Must be a whole number', 'type_error', value)
+                continue
+            value = kind(value)
+            if not math.isfinite(value):
+                fail(field, 'Must be a finite number', 'value_error', str(value))
+                continue
+            if 'min' in rule and value < rule['min']:
+                fail(field, f"Must be at least {rule['min']}", 'value_error', value)
+                continue
+            if 'max' in rule and value > rule['max']:
+                fail(field, f"Must be at most {rule['max']}", 'value_error', value)
+                continue
+        if 'choices' in rule and value not in rule['choices']:
+            fail(field, f"Must be one of: {', '.join(map(str, rule['choices']))}", 'value_error', value)
+            continue
+        cleaned[field] = value
+    return cleaned, errors
+
+
+def validation_error(errors: List[Dict[str, Any]]):
+    summary = '; '.join(f"{e['field']}: {e['message']}" for e in errors)
+    return api_error(400, 'VAL_001', f'Validation failed: {summary}', validation_errors=errors)
+
+
 def validate_body(rules: Dict[str, Dict[str, Any]], allow_empty: bool = False):
-    """
-    Validate the JSON body against `rules` and store the cleaned values in g.body.
-    Rule keys: type (str|int|float|bool), required, max_length, min, max, choices.
-    """
+    """Validate the JSON body against `rules` and store the cleaned values in g.body."""
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
@@ -149,61 +229,12 @@ def validate_body(rules: Dict[str, Dict[str, Any]], allow_empty: bool = False):
                 data = {}
             if not isinstance(data, dict):
                 return api_error(400, 'VAL_002', 'Request body must be a JSON object')
-
-            cleaned, errors = {}, []
-
-            def fail(field, message, kind, value=None):
-                errors.append({'field': field, 'message': message, 'type': kind, 'input': value})
-
-            for field, rule in rules.items():
-                if field not in data or data[field] is None:
-                    if rule.get('required'):
-                        fail(field, 'Field is required', 'missing')
-                    continue
-                value = data[field]
-                kind = rule['type']
-                if kind is str:
-                    if not isinstance(value, str):
-                        fail(field, 'Must be a string', 'type_error', value)
-                        continue
-                    value = value.strip()
-                    if rule.get('required') and not value:
-                        fail(field, 'Must not be empty', 'value_error')
-                        continue
-                    if len(value) > rule.get('max_length', 10000):
-                        fail(field, f"Must be at most {rule.get('max_length', 10000)} characters", 'value_error')
-                        continue
-                elif kind is bool:
-                    if not isinstance(value, bool):
-                        fail(field, 'Must be true or false', 'type_error', value)
-                        continue
-                else:
-                    if isinstance(value, bool) or not isinstance(value, (int, float)):
-                        fail(field, 'Must be a number', 'type_error', value)
-                        continue
-                    if kind is int and value != int(value):
-                        fail(field, 'Must be a whole number', 'type_error', value)
-                        continue
-                    value = kind(value)
-                    if not math.isfinite(value):
-                        fail(field, 'Must be a finite number', 'value_error', str(value))
-                        continue
-                    if 'min' in rule and value < rule['min']:
-                        fail(field, f"Must be at least {rule['min']}", 'value_error', value)
-                        continue
-                    if 'max' in rule and value > rule['max']:
-                        fail(field, f"Must be at most {rule['max']}", 'value_error', value)
-                        continue
-                if 'choices' in rule and value not in rule['choices']:
-                    fail(field, f"Must be one of: {', '.join(map(str, rule['choices']))}", 'value_error', value)
-                    continue
-                cleaned[field] = value
-
+            cleaned, errors = validate_fields(data, rules)
             if errors:
-                summary = '; '.join(f"{e['field']}: {e['message']}" for e in errors)
-                return api_error(400, 'VAL_001', f'Validation failed: {summary}', validation_errors=errors)
+                return validation_error(errors)
             g.body = cleaned
             return f(*args, **kwargs)
+        wrapper._body_rules = rules  # read by the OpenAPI generator
         return wrapper
     return decorator
 
@@ -262,6 +293,9 @@ def _authenticate() -> Optional[tuple]:
             if not row:
                 return api_error(401, 'AUTH_002', 'The API key is invalid or has been revoked')
             key, user = row
+            denied = _check_ip_rules(db, key.id)
+            if denied:
+                return denied
             g.principal = {
                 'kind': 'api_key',
                 'user_id': user.id,
@@ -275,6 +309,54 @@ def _authenticate() -> Optional[tuple]:
         logger.exception(f"Request {g.request_id}: authentication lookup failed")
         # Fail closed: never let a request through because the credential store is down.
         return api_error(503, 'AUTH_005', 'Authentication is temporarily unavailable')
+    return None
+
+
+def _check_ip_rules(db, key_id: int) -> Optional[tuple]:
+    """Blacklist rules always deny; if any whitelist rule exists, the caller must match one."""
+    rules = db.query(IPRule).filter_by(api_key_id=key_id).all()
+    if not rules:
+        return None
+    try:
+        ip = ipaddress.ip_address(client_ip())
+    except ValueError:
+        return api_error(403, 'AUTH_006', 'Request IP address could not be verified for this API key')
+
+    def matches(rule):
+        try:
+            return ip in ipaddress.ip_network(rule.ip_address, strict=False)
+        except ValueError:
+            return False
+
+    if any(matches(r) for r in rules if not r.is_whitelist):
+        return api_error(403, 'AUTH_006', 'This IP address is blocked for this API key')
+    whitelist = [r for r in rules if r.is_whitelist]
+    if whitelist and not any(matches(r) for r in whitelist):
+        return api_error(403, 'AUTH_006', 'This IP address is not allowed for this API key')
+    return None
+
+
+def consume_quota(units: int = 1) -> Optional[tuple]:
+    """Charge `units` against the caller's monthly quota (API keys only). Returns an error if exhausted."""
+    p = g.principal
+    quota = p['monthly_quota']
+    if quota is None or units <= 0:
+        return None
+    now = datetime.utcnow()
+    used = counter.incr_by(f"quota:{p['limit_key']}:{now:%Y%m}", units, 32 * 24 * 3600)
+    before = used - units
+
+    import webhooks  # local import: webhooks imports this module
+    warning_at = int(quota * 0.8)
+    if before < warning_at <= used <= quota:
+        webhooks.emit(p['user_id'], 'quota.warning', {'api_key_id': p.get('key_id'), 'used': used, 'quota': quota})
+    if before <= quota < used:
+        webhooks.emit(p['user_id'], 'quota.exceeded', {'api_key_id': p.get('key_id'), 'used': used, 'quota': quota})
+
+    if used > quota:
+        next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return api_error(429, 'RATE_002', f"Monthly quota of {quota} requests exhausted",
+                         retry_after=(next_month - now).total_seconds(), quota=quota, reset_time=next_month.isoformat())
     return None
 
 
@@ -293,14 +375,10 @@ def _enforce_limits() -> Optional[tuple]:
     }
     if used > p['rate_limit']:
         return api_error(429, 'RATE_001', f"Rate limit of {p['rate_limit']} requests per hour exceeded",
+                         retry_after=(hour_end - now).total_seconds(),
                          limit=p['rate_limit'], reset_time=hour_end.isoformat())
 
-    if p['monthly_quota'] is not None:
-        month_used = counter.incr(f"quota:{p['limit_key']}:{now:%Y%m}", 32 * 24 * 3600)
-        if month_used > p['monthly_quota']:
-            return api_error(429, 'RATE_002', f"Monthly quota of {p['monthly_quota']} requests exhausted",
-                             quota=p['monthly_quota'])
-    return None
+    return consume_quota(1)
 
 
 def require_auth(f):
@@ -311,6 +389,7 @@ def require_auth(f):
         if failure:
             return failure
         return f(*args, **kwargs)
+    wrapper._auth = 'api_key_or_session'
     return wrapper
 
 
@@ -327,16 +406,92 @@ def require_session(f):
         if failure:
             return failure
         return f(*args, **kwargs)
+    wrapper._auth = 'session'
     return wrapper
+
+
+IDEMPOTENCY_TTL = timedelta(hours=24)
+
+
+def idempotent(f):
+    """
+    Honour an Idempotency-Key header on POSTs: the first request runs, and a retry with the
+    same key and body within 24h gets the stored response instead of running again.
+    Server errors (5xx) are not stored, so the client can retry them. Place below @require_auth.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get('Idempotency-Key')
+        if not key:
+            return f(*args, **kwargs)
+        if len(key) > 100:
+            return api_error(400, 'IDEMP_003', 'Idempotency-Key must be at most 100 characters')
+
+        user_id = current_user_id()
+        fingerprint = hashlib.sha256(
+            request.method.encode() + b' ' + request.path.encode() + b'\n' + request.get_data()).hexdigest()
+        db = SessionLocal()
+        try:
+            db.query(IdempotencyRecord).filter(
+                IdempotencyRecord.created_at < datetime.utcnow() - IDEMPOTENCY_TTL).delete(synchronize_session=False)
+            existing = db.query(IdempotencyRecord).filter_by(user_id=user_id, key=key).first()
+            if existing:
+                if existing.fingerprint != fingerprint:
+                    return api_error(422, 'IDEMP_001', 'This Idempotency-Key was already used with a different request')
+                if existing.status_code is None:
+                    return api_error(409, 'IDEMP_002', 'A request with this Idempotency-Key is still being processed',
+                                     retry_after=2)
+                replay = app_response(existing.response_body, existing.status_code)
+                replay.headers['Idempotent-Replayed'] = 'true'
+                return replay
+            db.add(IdempotencyRecord(user_id=user_id, key=key, fingerprint=fingerprint))
+            try:
+                db.commit()
+            except IntegrityError:
+                # A concurrent request with the same key just claimed it.
+                db.rollback()
+                return api_error(409, 'IDEMP_002', 'A request with this Idempotency-Key is still being processed',
+                                 retry_after=2)
+        finally:
+            db.close()
+
+        result = None
+        try:
+            result = f(*args, **kwargs)
+            return result
+        finally:
+            db = SessionLocal()
+            try:
+                record = db.query(IdempotencyRecord).filter_by(user_id=user_id, key=key).first()
+                response = make_response(result) if result is not None else None
+                if response is None or response.status_code >= 500:
+                    db.delete(record)
+                else:
+                    record.status_code = response.status_code
+                    record.response_body = response.get_data(as_text=True)
+                db.commit()
+            except Exception:
+                logger.exception('Could not store idempotent response')
+            finally:
+                db.close()
+    return wrapper
+
+
+def app_response(body: str, status: int):
+    response = make_response(body, status)
+    response.mimetype = 'application/json'
+    return response
 
 
 def limit_by_ip(name: str, limit: int, window_seconds: int):
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
-            window = int(time.time()) // window_seconds
+            now = time.time()
+            window = int(now) // window_seconds
             if counter.incr(f"ip:{name}:{client_ip()}:{window}", window_seconds) > limit:
-                return api_error(429, 'RATE_003', 'Too many attempts. Try again later.')
+                return api_error(429, 'RATE_003', 'Too many attempts. Try again later.',
+                                 retry_after=(window + 1) * window_seconds - now)
             return f(*args, **kwargs)
         return wrapper
     return decorator
@@ -450,9 +605,57 @@ def score_answer(student_answer: str, marking_guide: str, question_text: str = "
     }
 
 
+# --- Usage tracking ------------------------------------------------------------------------
+
+def record_usage(response) -> None:
+    """Log the request for analytics, and emit error.occurred on server-side failures. Never raises."""
+    p = g.principal
+    try:
+        size = response.calculate_content_length()
+        if size is None and not response.is_streamed:
+            size = len(response.get_data())
+        db = SessionLocal()
+        try:
+            db.add(ApiUsage(
+                user_id=p['user_id'],
+                api_key_id=p.get('key_id'),
+                method=request.method,
+                endpoint=request.url_rule.rule if request.url_rule else request.path,
+                status_code=response.status_code,
+                response_time=round(time.time() - g.start_time, 4),
+                request_size=request.content_length or 0,
+                response_size=size or 0,
+                units=g.get('usage_units', 1),
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        logger.exception("Could not record API usage")
+
+    if response.status_code >= 500:
+        import webhooks
+        webhooks.emit(p['user_id'], 'error.occurred', {
+            'request_id': g.get('request_id'),
+            'method': request.method,
+            'endpoint': request.path,
+            'status_code': response.status_code,
+        })
+
+
 # --- Routes ------------------------------------------------------------------------------
 
 TEXT_LIMITS = {'answer': 20000, 'marking_guide': 20000, 'question_text': 5000}
+
+SCORE_RULES = {
+    'student_answer': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['answer']},
+    'marking_guide': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['marking_guide']},
+    'question_text': {'type': str, 'max_length': TEXT_LIMITS['question_text']},
+    'student_name': {'type': str, 'max_length': 100},
+    'matric_number': {'type': str, 'max_length': 50},
+    'metadata': {'type': dict},
+    'max_score': {'type': float, 'min': 0.01, 'max': MAX_ALLOWED_SCORE},
+}
 
 
 def register_api_routes(app):
@@ -466,6 +669,8 @@ def register_api_routes(app):
     def after_request(response):
         for header, value in getattr(g, 'rate_limit_headers', {}).items():
             response.headers[header] = value
+        if 'principal' in g:
+            record_usage(response)
         response.headers['X-Request-ID'] = g.get('request_id', '')
         if hasattr(g, 'start_time'):
             logger.info(f"Request {g.request_id}: {request.method} {request.path} -> {response.status_code} "
@@ -546,15 +751,11 @@ def register_api_routes(app):
 
     @app.route('/api/v1/score', methods=['POST'])
     @require_auth
-    @validate_body({
-        'student_answer': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['answer']},
-        'marking_guide': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['marking_guide']},
-        'question_text': {'type': str, 'max_length': TEXT_LIMITS['question_text']},
-        'student_name': {'type': str, 'max_length': 100},
-        'matric_number': {'type': str, 'max_length': 50},
-        'max_score': {'type': float, 'min': 0.01, 'max': MAX_ALLOWED_SCORE},
-    })
+    @idempotent
+    @validate_body(SCORE_RULES)
     def api_score_answer():
+        """Grade one answer against a marking guide (nothing is stored)."""
+        import webhooks
         body = g.body
         max_score = body.get('max_score', MAX_SCORE)
         if round(max_score, 2) != max_score:
@@ -567,9 +768,13 @@ def register_api_routes(app):
         payload = {'timestamp': now_iso(), 'request_id': g.request_id, **result}
         if body.get('student_name') or body.get('matric_number'):
             payload['student_info'] = {'name': body.get('student_name'), 'matric_number': body.get('matric_number')}
-        metadata = (request.get_json(silent=True) or {}).get('metadata')
-        if isinstance(metadata, dict):
-            payload['metadata'] = metadata
+        if body.get('metadata'):
+            payload['metadata'] = body['metadata']
+        webhooks.emit(current_user_id(), 'scoring.complete', {
+            'request_id': g.request_id, 'score': result['data']['score'], 'max_score': result['data']['max_score'],
+            'needs_review': result['needs_review'], 'processing_time': result['processing_time'],
+            'metadata': body.get('metadata'),
+        })
         return jsonify(payload)
 
     @app.route('/api/v1/generate-questions', methods=['POST'])
@@ -650,6 +855,7 @@ def register_api_routes(app):
 
     @app.route('/api/v1/questions', methods=['POST'])
     @require_auth
+    @idempotent
     @validate_body({
         'question_text': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['question_text']},
         'marking_guide': {'type': str, 'required': True, 'max_length': TEXT_LIMITS['marking_guide']},
@@ -725,6 +931,7 @@ def register_api_routes(app):
 
     @app.route('/api/v1/students', methods=['POST'])
     @require_auth
+    @idempotent
     @validate_body({
         'name': {'type': str, 'required': True, 'max_length': 100},
         'matric_number': {'type': str, 'required': True, 'max_length': 50},
@@ -812,6 +1019,7 @@ def register_api_routes(app):
 
     @app.route('/api/v1/responses', methods=['POST'])
     @require_auth
+    @idempotent
     @validate_body({
         'student_id': {'type': int, 'required': True, 'min': 1},
         'question_id': {'type': int, 'required': True, 'min': 1},
@@ -898,6 +1106,7 @@ def register_api_routes(app):
 
     @app.route('/api/v1/submit-response', methods=['POST'])
     @require_auth
+    @idempotent
     @validate_body({
         'student_id': {'type': int, 'required': True, 'min': 1},
         'question_id': {'type': int, 'required': True, 'min': 1},
@@ -953,6 +1162,12 @@ def register_api_routes(app):
             db.rollback()
             return api_error(409, 'RES_003', 'This student already submitted an answer to this question')
 
+        import webhooks
+        webhooks.emit(current_user_id(), 'scoring.complete', {
+            'request_id': g.request_id, 'response_id': response.id, 'student_id': student.id,
+            'question_id': question.id, 'score': data['score'], 'max_score': data['max_score'],
+            'grading_status': status, 'processing_time': result['processing_time'],
+        })
         return jsonify({
             'success': True,
             'message': 'Response submitted and scored successfully' if status == GRADED
@@ -1019,6 +1234,7 @@ def register_api_routes(app):
 
     @app.route('/api/v1/api-keys', methods=['POST'])
     @require_session
+    @idempotent
     @validate_body({
         'key_name': {'type': str, 'required': True, 'max_length': 100},
         'plan_type': {'type': str, 'choices': tuple(PLAN_LIMITS)},
@@ -1060,11 +1276,14 @@ def register_api_routes(app):
             return api_error(404, 'RES_001', 'API key not found')
         key.is_active = False
         db.commit()
+        import webhooks
+        webhooks.emit(current_user_id(), 'api_key.revoked', {'api_key_id': key_id, 'key_name': key.key_name})
         return jsonify({'success': True, 'message': 'API key revoked successfully', 'api_key_id': key_id,
                         'timestamp': now_iso()})
 
     @app.route('/api/v1/api-keys/<int:key_id>/rotate', methods=['POST'])
     @require_session
+    @idempotent
     @validate_body({'key_name': {'type': str, 'max_length': 100}}, allow_empty=True)
     def api_rotate_api_key(key_id):
         db = get_db()
@@ -1074,7 +1293,13 @@ def register_api_routes(app):
         old.is_active = False
         name = g.body.get('key_name') or old.key_name
         key, plaintext = new_api_key(db, current_user_id(), name, old.plan_type, old.rate_limit, old.monthly_quota)
+        db.flush()  # assigns key.id
+        # IP rules follow the key to its replacement.
+        for rule in db.query(IPRule).filter_by(api_key_id=old.id).all():
+            db.add(IPRule(api_key_id=key.id, ip_address=rule.ip_address, is_whitelist=rule.is_whitelist))
         db.commit()
+        import webhooks
+        webhooks.emit(current_user_id(), 'api_key.rotated', {'old_key_id': old.id, 'new_key_id': key.id, 'key_name': name})
         return jsonify({
             'success': True,
             'message': 'API key rotated. Copy the new key now; it will not be shown again.',
@@ -1168,3 +1393,18 @@ def register_api_routes(app):
         db.query(AuthToken).filter_by(id=g.principal['token_id']).update({AuthToken.is_active: False})
         db.commit()
         return jsonify({'success': True, 'message': 'Logout successful', 'timestamp': now_iso()})
+
+    # --- Platform features (separate modules) --------------------------------------------------
+    from analytics import register_analytics_routes
+    from batch import register_batch_routes
+    from data_ops import register_data_routes
+    from ip_rules import register_ip_rule_routes
+    from meta import register_meta_routes
+    from webhooks import register_webhook_routes
+
+    register_analytics_routes(app)
+    register_batch_routes(app)
+    register_data_routes(app)
+    register_ip_rule_routes(app)
+    register_meta_routes(app)
+    register_webhook_routes(app)

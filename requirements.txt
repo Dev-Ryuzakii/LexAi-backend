@@ -9,5 +9,6 @@ redis==8.1.0
 requests==2.34.2
 scikit-learn==1.9.1
 gunicorn==23.0.0
+PyYAML==6.0.3
 # Optional provider; the API runs without it
 # cohere==4.37.0
