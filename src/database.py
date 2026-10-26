@@ -5,7 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     create_engine, event, func, Column, Integer, String, Text, Boolean, ForeignKey, Float, DateTime,
-    UniqueConstraint,
+    Index, UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -113,6 +113,73 @@ class AuthToken(Base):
     user = relationship("User", back_populates="auth_tokens")
 
 
+class ApiUsage(Base):
+    """One row per authenticated request; the source for analytics and quota reporting."""
+    __tablename__ = 'api_usage'
+    __table_args__ = (Index('ix_api_usage_user_created', 'user_id', 'created_at'),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    api_key_id = Column(Integer, ForeignKey('api_keys.id'), nullable=True, index=True)
+    method = Column(String(10), nullable=False)
+    endpoint = Column(String(200), nullable=False)  # route pattern, e.g. /api/v1/questions/<int:question_id>
+    status_code = Column(Integer, nullable=False)
+    response_time = Column(Float, nullable=False)  # seconds
+    request_size = Column(Integer, default=0)
+    response_size = Column(Integer, default=0)
+    units = Column(Integer, default=1)  # quota units consumed (a batch of n answers uses n)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class IPRule(Base):
+    __tablename__ = 'api_key_ip_rules'
+    id = Column(Integer, primary_key=True)
+    api_key_id = Column(Integer, ForeignKey('api_keys.id', ondelete='CASCADE'), nullable=False, index=True)
+    ip_address = Column(String(64), nullable=False)  # single address or CIDR
+    is_whitelist = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Webhook(Base):
+    __tablename__ = 'webhooks'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    url = Column(String(2000), nullable=False)
+    events = Column(Text, nullable=False)  # JSON list of event names
+    # Kept in plaintext because it is needed to sign every delivery.
+    secret = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_delivery_at = Column(DateTime, nullable=True)
+    last_status = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Job(Base):
+    """Background work (currently asynchronous batch scoring)."""
+    __tablename__ = 'jobs'
+    id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    type = Column(String(50), nullable=False)
+    status = Column(String(20), nullable=False, default='queued')  # queued | started | finished | failed
+    result = Column(Text, nullable=True)  # JSON
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+
+
+class IdempotencyRecord(Base):
+    """Stored outcome of a POST sent with an Idempotency-Key, replayed if the client retries."""
+    __tablename__ = 'idempotency_keys'
+    __table_args__ = (UniqueConstraint('user_id', 'key', name='uq_idempotency_user_key'),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    key = Column(String(100), nullable=False)
+    fingerprint = Column(String(64), nullable=False)  # sha256 of method, path and body
+    status_code = Column(Integer, nullable=True)  # null while the first request is still running
+    response_body = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
 # --- Credentials -----------------------------------------------------------------
 
 def hash_password(password: str) -> str:
@@ -172,6 +239,8 @@ def _make_engine(url: str):
         if path and path != ':memory:':
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         connect_args['check_same_thread'] = False
+        # Wait up to 15s for a competing writer instead of failing with "database is locked".
+        connect_args['timeout'] = 15
     eng = create_engine(url, connect_args=connect_args, pool_pre_ping=True)
     if url.startswith('sqlite'):
         @event.listens_for(eng, 'connect')
